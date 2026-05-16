@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus — Recommendation Demo</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0A0A0F;
+    --surface:   #111118;
+    --surface2:  #18181F;
+    --border:    #2A2A35;
+    --accent:    #C8FF00;
+    --accent2:   #FF6B35;
+    --text:      #EEEEF5;
+    --muted:     #6B6B80;
+    --card-bg:   #13131A;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Mono', monospace;
+    min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1.25rem 2.5rem;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: rgba(10,10,15,0.92);
+    backdrop-filter: blur(12px);
+    z-index: 100;
+  }
+
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.4rem;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+
+  .logo span { color: var(--accent); }
+
+  .api-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #444;
+    transition: background 0.3s;
+  }
+  .status-dot.online  { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .status-dot.offline { background: #FF4444; }
+
+  /* ── Layout ── */
+  .shell {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    min-height: calc(100vh - 61px);
+  }
+
+  /* ── Sidebar ── */
+  sidebar {
+    display: block;
+    border-right: 1px solid var(--border);
+    padding: 1.5rem;
+    background: var(--surface);
+  }
+
+  .sidebar-section { margin-bottom: 2rem; }
+
+  .sidebar-label {
+    font-size: 0.65rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.75rem;
+  }
+
+  .mode-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0.65rem 0.875rem;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.8rem;
+    cursor: pointer;
+    margin-bottom: 4px;
+    transition: all 0.15s;
+    text-align: left;
+  }
+
+  .mode-btn:hover { background: var(--surface2); color: var(--text); }
+  .mode-btn.active {
+    background: rgba(200,255,0,0.08);
+    border-color: rgba(200,255,0,0.25);
+    color: var(--accent);
+  }
+
+  .mode-icon { font-size: 1rem; width: 20px; text-align: center; }
+
+  .input-group { margin-bottom: 1rem; }
+
+  .input-label {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-bottom: 0.4rem;
+    letter-spacing: 0.06em;
+  }
+
+  input, select {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.8rem;
+    padding: 0.6rem 0.75rem;
+    border-radius: 7px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  input:focus, select:focus { border-color: var(--accent); }
+  select option { background: var(--surface2); }
+
+  .run-btn {
+    width: 100%;
+    padding: 0.75rem;
+    background: var(--accent);
+    color: #000;
+    border: none;
+    border-radius: 8px;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 0.85rem;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+    margin-top: 0.5rem;
+  }
+
+  .run-btn:hover   { opacity: 0.88; }
+  .run-btn:active  { transform: scale(0.98); }
+  .run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Main ── */
+  main {
+    padding: 2rem 2.5rem;
+    overflow-y: auto;
+  }
+
+  .page-title {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.6rem;
+    margin-bottom: 0.35rem;
+    letter-spacing: -0.02em;
+  }
+
+  .page-sub {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-bottom: 2rem;
+  }
+
+  /* ── Stat Strip ── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }
+
+  .stat-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+  }
+
+  .stat-val {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 1.5rem;
+    color: var(--accent);
+  }
+
+  .stat-lbl { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+
+  /* ── Results ── */
+  .results-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+  }
+
+  .results-title {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 1rem;
+  }
+
+  .tag {
+    font-size: 0.65rem;
+    padding: 3px 8px;
+    border-radius: 20px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .tag-cold  { background: rgba(255,107,53,0.15); color: var(--accent2); border: 1px solid rgba(255,107,53,0.3); }
+  .tag-warm  { background: rgba(200,255,0,0.1);   color: var(--accent);  border: 1px solid rgba(200,255,0,0.25); }
+
+  /* ── Item Grid ── */
+  .item-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 1rem;
+  }
+
+  .item-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    position: relative;
+    transition: border-color 0.2s, transform 0.15s;
+    animation: fadeUp 0.3s ease both;
+  }
+
+  .item-card:hover {
+    border-color: rgba(200,255,0,0.3);
+    transform: translateY(-2px);
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .item-rank {
+    position: absolute;
+    top: 10px; right: 12px;
+    font-size: 0.65rem;
+    color: var(--muted);
+  }
+
+  .item-icon {
+    width: 44px; height: 44px;
+    border-radius: 10px;
+    background: var(--surface2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.4rem;
+    margin-bottom: 0.875rem;
+  }
+
+  .item-title {
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    font-size: 0.82rem;
+    line-height: 1.4;
+    margin-bottom: 0.5rem;
+    color: var(--text);
+    text-transform: capitalize;
+  }
+
+  .item-id {
+    font-size: 0.65rem;
+    color: var(--muted);
+    margin-bottom: 0.75rem;
+  }
+
+  .item-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .item-price {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--accent);
+  }
+
+  .item-score {
+    font-size: 0.68rem;
+    color: var(--muted);
+  }
+
+  .score-bar {
+    width: 100%;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    margin-top: 0.5rem;
+    overflow: hidden;
+  }
+
+  .score-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), #88FF00);
+    border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+
+  /* ── Score breakdown ── */
+  .breakdown {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+  }
+
+  .breakdown-pill {
+    font-size: 0.6rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  /* ── Empty/Loading States ── */
+  .empty-state {
+    text-align: center;
+    padding: 4rem 2rem;
+    color: var(--muted);
+  }
+
+  .empty-icon { font-size: 3rem; margin-bottom: 1rem; }
+  .empty-title { font-family: 'Syne', sans-serif; font-size: 1rem; margin-bottom: 0.5rem; color: var(--text); }
+  .empty-sub { font-size: 0.78rem; }
+
+  .loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 3rem;
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+
+  .spinner {
+    width: 18px; height: 18px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .error-box {
+    background: rgba(255,68,68,0.08);
+    border: 1px solid rgba(255,68,68,0.3);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    color: #FF8888;
+    font-size: 0.8rem;
+    margin-bottom: 1.5rem;
+  }
+
+  /* ── API Inspector ── */
+  .api-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
+  .api-url { color: var(--accent); word-break: break-all; }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 1.5rem;
+    background: var(--surface);
+    padding: 4px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    width: fit-content;
+  }
+
+  .tab {
+    padding: 0.45rem 1rem;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .tab.active {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">NEX<span>US</span> <span style="font-size:0.7rem;font-weight:400;color:var(--muted);font-family:'DM Mono'">/ rec-demo</span></div>
+  <div class="api-status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Connecting to API...</span>
+  </div>
+</header>
+
+<div class="shell">
+  <sidebar>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Mode</div>
+      <button class="mode-btn active" onclick="setMode('personal')" id="btn-personal">
+        <span class="mode-icon">🎯</span> Personalized
+      </button>
+      <button class="mode-btn" onclick="setMode('popular')" id="btn-popular">
+        <span class="mode-icon">🔥</span> Popular Items
+      </button>
+      <button class="mode-btn" onclick="setMode('similar')" id="btn-similar">
+        <span class="mode-icon">🔗</span> Similar Items
+      </button>
+    </div>
+
+    <div class="sidebar-section" id="personalControls">
+      <div class="sidebar-label">Parameters</div>
+      <div class="input-group">
+        <label class="input-label">User ID</label>
+        <input type="text" id="userInput" placeholder="e.g. 12345" />
+      </div>
+      <button class="run-btn" onclick="loadRandomUser()" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);margin-bottom:6px;font-family:'DM Mono';font-weight:400;font-size:0.75rem;">
+        ↺ Random user
+      </button>
+      <div class="input-group">
+        <label class="input-label">Top N results</label>
+        <select id="topNSelect">
+          <option value="6">6 items</option>
+          <option value="10" selected>10 items</option>
+          <option value="20">20 items</option>
+        </select>
+      </div>
+      <button class="run-btn" id="runBtn" onclick="runPersonal()">Get Recommendations →</button>
+    </div>
+
+    <div class="sidebar-section" id="popularControls" style="display:none">
+      <div class="sidebar-label">Parameters</div>
+      <div class="input-group">
+        <label class="input-label">Top N results</label>
+        <select id="topNPopular">
+          <option value="6">6 items</option>
+          <option value="10" selected>10 items</option>
+          <option value="20">20 items</option>
+        </select>
+      </div>
+      <button class="run-btn" onclick="runPopular()">Get Popular Items →</button>
+    </div>
+
+    <div class="sidebar-section" id="similarControls" style="display:none">
+      <div class="sidebar-label">Parameters</div>
+      <div class="input-group">
+        <label class="input-label">Item ID</label>
+        <input type="text" id="itemInput" placeholder="e.g. 85123A" />
+      </div>
+      <div class="input-group">
+        <label class="input-label">Top N results</label>
+        <select id="topNSimilar">
+          <option value="6">6 items</option>
+          <option value="10" selected>10 items</option>
+        </select>
+      </div>
+      <button class="run-btn" onclick="runSimilar()">Find Similar →</button>
+    </div>
+  </sidebar>
+
+  <main>
+    <!-- Stats Strip -->
+    <div class="stats" id="statsStrip" style="display:none">
+      <div class="stat-card">
+        <div class="stat-val" id="statUsers">—</div>
+        <div class="stat-lbl">Known users</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="statItems">—</div>
+        <div class="stat-lbl">Catalog items</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="statAlpha">—</div>
+        <div class="stat-lbl">α (CF weight)</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="statBeta">—</div>
+        <div class="stat-lbl">β (Content weight)</div>
+      </div>
+    </div>
+
+    <!-- Error box -->
+    <div class="error-box" id="errorBox" style="display:none"></div>
+
+    <!-- Content area -->
+    <div id="contentArea">
+      <div class="empty-state">
+        <div class="empty-icon">⚡</div>
+        <div class="empty-title">Nexus Recommendation Engine</div>
+        <div class="empty-sub">Select a mode and run a query to see recommendations</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+  const API = 'http://localhost:8000';
+  let currentMode = 'personal';
+  let knownUsers  = [];
+
+  const ICONS = ['🕰️','🖼️','💎','🪔','🏺','🧸','🪑','🎨','📦','🔮','🪙','🗝️','🧲','🎭','🪆'];
+
+  // ── API Health Check ──────────────────────────────────────────────────────
+
+  async function checkHealth() {
+    try {
+      const r = await fetch(`${API}/health`);
+      if (!r.ok) throw new Error();
+      const d = await r.json();
+
+      document.getElementById('statusDot').className  = 'status-dot online';
+      document.getElementById('statusText').textContent = 'API online';
+      document.getElementById('statsStrip').style.display = 'grid';
+      document.getElementById('statItems').textContent  = d.catalog_size?.toLocaleString() ?? '—';
+      document.getElementById('statAlpha').textContent  = d.weights?.alpha ?? '—';
+      document.getElementById('statBeta').textContent   = d.weights?.beta  ?? '—';
+
+      // Load users for random picker
+      const ur = await fetch(`${API}/users?limit=100`);
+      const ud = await ur.json();
+      knownUsers = ud.users ?? [];
+      document.getElementById('statUsers').textContent = knownUsers.length.toLocaleString();
+
+    } catch {
+      document.getElementById('statusDot').className   = 'status-dot offline';
+      document.getElementById('statusText').textContent = 'API offline — start FastAPI first';
+      showError('Cannot connect to API at ' + API + '. Make sure you ran: uvicorn main:app --reload --port 8000');
+    }
+  }
+
+  // ── Mode Switching ────────────────────────────────────────────────────────
+
+  function setMode(mode) {
+    currentMode = mode;
+    ['personal','popular','similar'].forEach(m => {
+      document.getElementById(`btn-${m}`).classList.toggle('active', m === mode);
+      document.getElementById(`${m}Controls`).style.display = m === mode ? 'block' : 'none';
+    });
+    clearResults();
+  }
+
+  // ── Queries ───────────────────────────────────────────────────────────────
+
+  async function runPersonal() {
+    const userId = document.getElementById('userInput').value.trim();
+    const topN   = document.getElementById('topNSelect').value;
+    if (!userId) { showError('Please enter a User ID.'); return; }
+
+    setLoading(`Fetching recommendations for user ${userId}...`);
+    clearError();
+
+    try {
+      const r = await fetch(`${API}/recommend?user_id=${encodeURIComponent(userId)}&top_n=${topN}`);
+      if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+      const d = await r.json();
+      renderPersonal(d);
+    } catch(e) { showError(e.message); clearLoading(); }
+  }
+
+  async function runPopular() {
+    const topN = document.getElementById('topNPopular').value;
+    setLoading('Fetching popular items...');
+    clearError();
+
+    try {
+      const r = await fetch(`${API}/popular?top_n=${topN}`);
+      const d = await r.json();
+      renderPopular(d);
+    } catch(e) { showError(e.message); clearLoading(); }
+  }
+
+  async function runSimilar() {
+    const itemId = document.getElementById('itemInput').value.trim().toUpperCase();
+    const topN   = document.getElementById('topNSimilar').value;
+    if (!itemId) { showError('Please enter an Item ID.'); return; }
+
+    setLoading(`Finding items similar to ${itemId}...`);
+    clearError();
+
+    try {
+      const r = await fetch(`${API}/similar/${encodeURIComponent(itemId)}?top_n=${topN}`);
+      if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+      const d = await r.json();
+      renderSimilar(d);
+    } catch(e) { showError(e.message); clearLoading(); }
+  }
+
+  function loadRandomUser() {
+    if (!knownUsers.length) { showError('No users loaded yet — is the API running?'); return; }
+    const u = knownUsers[Math.floor(Math.random() * knownUsers.length)];
+    document.getElementById('userInput').value = u;
+  }
+
+  // ── Renders ───────────────────────────────────────────────────────────────
+
+  function renderPersonal(d) {
+    const isCold = d.cold_start;
+    const maxScore = Math.max(...d.recommendations.map(r => r.score));
+
+    let html = `
+      <div class="results-header">
+        <div class="results-title">Recommendations for <span style="color:var(--accent)">${d.user_id}</span></div>
+        <span class="tag ${isCold ? 'tag-cold' : 'tag-warm'}">${isCold ? '❄️ Cold start' : '✓ Personalized'}</span>
+      </div>
+      <div class="api-box">
+        <span style="color:var(--muted)">GET </span>
+        <span class="api-url">${API}/recommend?user_id=${d.user_id}&top_n=${d.count}</span>
+      </div>
+      <div class="item-grid">
+    `;
+
+    d.recommendations.forEach((item, i) => {
+      const pct = maxScore > 0 ? (item.score / maxScore * 100).toFixed(0) : 0;
+      html += itemCard(item, i, pct, [
+        `CF: ${item.cf_score?.toFixed(3) ?? 'n/a'}`,
+        `CB: ${item.content_score?.toFixed(3) ?? 'n/a'}`,
+        `Pop: ${item.pop_score?.toFixed(3) ?? 'n/a'}`
+      ]);
+    });
+
+    html += '</div>';
+    setContent(html);
+  }
+
+  function renderPopular(d) {
+    const maxPop = Math.max(...d.items.map(i => i.popularity));
+    let html = `
+      <div class="results-header">
+        <div class="results-title">🔥 Most Popular Items</div>
+        <span class="tag tag-warm">By interaction score</span>
+      </div>
+      <div class="api-box">
+        <span style="color:var(--muted)">GET </span>
+        <span class="api-url">${API}/popular?top_n=${d.count}</span>
+      </div>
+      <div class="item-grid">
+    `;
+
+    d.items.forEach((item, i) => {
+      const pct = (item.popularity / maxPop * 100).toFixed(0);
+      html += itemCard({...item, score: item.popularity}, i, pct, [`Interactions: ${item.popularity.toLocaleString()}`]);
+    });
+
+    html += '</div>';
+    setContent(html);
+  }
+
+  function renderSimilar(d) {
+    const maxSim = Math.max(...d.similar.map(i => i.similarity));
+    let html = `
+      <div class="results-header">
+        <div class="results-title">Items similar to <span style="color:var(--accent)">${d.seed_item.item_title || d.seed_item.item_id}</span></div>
+        <span class="tag tag-warm">SBERT Similarity</span>
+      </div>
+      <div class="api-box">
+        <span style="color:var(--muted)">GET </span>
+        <span class="api-url">${API}/similar/${d.seed_item.item_id}?top_n=${d.count}</span>
+      </div>
+      <div class="item-grid">
+    `;
+
+    d.similar.forEach((item, i) => {
+      const pct = (item.similarity / maxSim * 100).toFixed(0);
+      html += itemCard({...item, score: item.similarity, item_title: item.item_title}, i, pct, [`Similarity: ${(item.similarity * 100).toFixed(1)}%`]);
+    });
+
+    html += '</div>';
+    setContent(html);
+  }
+
+  function itemCard(item, i, scorePct, pills) {
+    const icon = ICONS[i % ICONS.length];
+    const price = item.avg_price ? `£${item.avg_price.toFixed(2)}` : '—';
+    const pillsHtml = pills.map(p => `<span class="breakdown-pill">${p}</span>`).join('');
+    const delay = i * 40;
+
+    return `
+      <div class="item-card" style="animation-delay:${delay}ms">
+        <div class="item-rank">#${i+1}</div>
+        <div class="item-icon">${icon}</div>
+        <div class="item-title">${item.item_title || 'Unknown item'}</div>
+        <div class="item-id">${item.item_id}</div>
+        <div class="score-bar"><div class="score-fill" style="width:${scorePct}%"></div></div>
+        <div class="breakdown">${pillsHtml}</div>
+        <div class="item-footer">
+          <div class="item-price">${price}</div>
+          <div class="item-score">score ${typeof item.score === 'number' ? item.score.toFixed(4) : '—'}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function setContent(html) { document.getElementById('contentArea').innerHTML = html; }
+
+  function clearResults() {
+    setContent(`
+      <div class="empty-state">
+        <div class="empty-icon">⚡</div>
+        <div class="empty-title">Ready</div>
+        <div class="empty-sub">Configure parameters and run a query</div>
+      </div>
+    `);
+  }
+
+  function setLoading(msg) {
+    setContent(`<div class="loading"><div class="spinner"></div>${msg}</div>`);
+  }
+
+  function clearLoading() { clearResults(); }
+
+  function showError(msg) {
+    const b = document.getElementById('errorBox');
+    b.textContent = '⚠ ' + msg;
+    b.style.display = 'block';
+  }
+
+  function clearError() {
+    document.getElementById('errorBox').style.display = 'none';
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  checkHealth();
+  setInterval(checkHealth, 30000);
+</script>
+</body>
+</html>

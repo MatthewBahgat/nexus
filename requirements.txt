@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+sentence-transformers
+scipy
+openpyxl
+matplotlib
+seaborn
+jupyter
+fastapi
+uvicorn
