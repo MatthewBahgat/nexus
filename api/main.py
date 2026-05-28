@@ -34,10 +34,85 @@ app.add_middleware(
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "processed")
 
+# ── PostgreSQL Connection ─────────────────────────────────────────────────────
+# Replace placeholders with real credentials from backend team
+# Or set as environment variables on Railway
+
+DB_HOST     = os.getenv("DB_HOST",     "YOUR_DB_HOST")
+DB_PORT     = os.getenv("DB_PORT",     "5432")
+DB_NAME     = os.getenv("DB_NAME",     "YOUR_DB_NAME")
+DB_USER     = os.getenv("DB_USER",     "YOUR_DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "YOUR_DB_PASSWORD")
+DB_URL      = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+def load_from_db():
+    """
+    Load interactions and item catalog directly from Nexus PostgreSQL database.
+    Falls back to static files if DB connection fails.
+    """
+    try:
+        import sqlalchemy
+        engine = sqlalchemy.create_engine(DB_URL)
+
+        # Load item catalog from item + category tables
+        catalog_query = """
+            SELECT 
+                i.id::text          AS item_id,
+                i.name              AS item_title,
+                i.starting_price    AS avg_price,
+                c.name              AS category,
+                0                   AS popularity,
+                0                   AS n_interactions
+            FROM item i
+            LEFT JOIN category c ON i.category_id = c.id
+        """
+
+        # Load interactions from bid + auction tables
+        # bid = interaction_weight 3 (strongest signal)
+        interactions_query = """
+            SELECT
+                b.bidder_id::text       AS user_id,
+                a.item_id::text         AS item_id,
+                i.name                  AS item_title,
+                3                       AS interaction_weight,
+                b.bid_time              AS interaction_timestamp,
+                b.bid_amount            AS price
+            FROM bid b
+            JOIN auction a ON b.auction_id = a.id
+            JOIN item i    ON a.item_id    = i.id
+        """
+
+        catalog = pd.read_sql(catalog_query, engine)
+        train   = pd.read_sql(interactions_query, engine)
+
+        # Calculate popularity from interaction counts
+        popularity = train.groupby("item_id")["interaction_weight"].sum().reset_index()
+        popularity.columns = ["item_id", "popularity"]
+        catalog = catalog.merge(popularity, on="item_id", how="left", suffixes=("", "_new"))
+        if "popularity_new" in catalog.columns:
+            catalog["popularity"] = catalog["popularity_new"].fillna(0)
+            catalog.drop(columns=["popularity_new"], inplace=True)
+        else:
+            catalog["popularity"] = catalog["popularity"].fillna(0)
+
+        print(f"DB loaded: {len(catalog):,} items | {len(train):,} interactions")
+        return catalog, train
+
+    except Exception as e:
+        print(f"DB connection failed: {e}")
+        print("Falling back to static files...")
+        return None, None
+
+
 print("Loading artifacts...")
 
-catalog = pd.read_csv(f"{DATA_DIR}/item_catalog.csv")
-train   = pd.read_csv(f"{DATA_DIR}/train.csv")
+# Try DB first, fall back to static files
+catalog, train = load_from_db()
+
+if catalog is None or train is None:
+    catalog = pd.read_csv(f"{DATA_DIR}/item_catalog.csv")
+    train   = pd.read_csv(f"{DATA_DIR}/train.csv")
+    print(f"Static files loaded: {len(catalog):,} items | {len(train):,} interactions")
 
 with open(f"{DATA_DIR}/content_data.pkl", "rb") as f:
     content_data = pickle.load(f)
