@@ -38,11 +38,11 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"
 # Replace placeholders with real credentials from backend team
 # Or set as environment variables on Railway
 
-DB_HOST     = os.getenv("DB_HOST",     "YOUR_DB_HOST")  # ask backend team for host
+DB_HOST     = os.getenv("DB_HOST",     "YOUR_DB_HOST")
 DB_PORT     = os.getenv("DB_PORT",     "5432")
-DB_NAME     = os.getenv("DB_NAME",     "Nexus")
-DB_USER     = os.getenv("DB_USER",     "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
+DB_NAME     = os.getenv("DB_NAME",     "YOUR_DB_NAME")
+DB_USER     = os.getenv("DB_USER",     "YOUR_DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "YOUR_DB_PASSWORD")
 DB_URL      = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 def load_from_db():
