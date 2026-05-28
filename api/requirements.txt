@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scikit-learn
+sentence-transformers
+scipy
+openpyxl
+
+sqlalchemy
+psycopg2-binary
