@@ -14,8 +14,6 @@ import pandas as pd
 import numpy as np
 import pickle
 from sklearn.metrics.pairwise import cosine_similarity
-from chatbot_api import app as chatbot_app
-
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 
@@ -31,7 +29,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/chatbot", chatbot_app)
+
 # ── Load Artifacts ─────────────────────────────────────────────────────────────
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "processed")
