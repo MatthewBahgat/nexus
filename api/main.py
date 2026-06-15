@@ -1,26 +1,21 @@
 import os
-import sys
-"""
-Nexus Recommendation System — FastAPI Service
-Run with: python -m uvicorn main:app --reload --port 8000
-
-Dependencies (all already installed from notebooks):
-  pip install fastapi uvicorn pandas numpy scikit-learn sentence-transformers scipy
-"""
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
-import pickle
+from sqlalchemy import create_engine
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Nexus Recommendation API",
-    description="Hybrid recommendation system for the Nexus auction platform",
-    version="1.0.0"
+    description="Database-driven recommendation system for the Nexus auction platform",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -30,276 +25,529 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load Artifacts ─────────────────────────────────────────────────────────────
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "processed")
+# ── Database Config ───────────────────────────────────────────────────────────
 
-# ── PostgreSQL Connection ─────────────────────────────────────────────────────
-# Replace placeholders with real credentials from backend team
-# Or set as environment variables on Railway
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DB_HOST     = os.getenv("DB_HOST",     "YOUR_DB_HOST")
-DB_PORT     = os.getenv("DB_PORT",     "5432")
-DB_NAME     = os.getenv("DB_NAME",     "YOUR_DB_NAME")
-DB_USER     = os.getenv("DB_USER",     "YOUR_DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "YOUR_DB_PASSWORD")
-DB_URL      = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is missing. Example: "
+        "postgresql://postgres:postgres@postgres:5432/nexus"
+    )
+
+engine = create_engine(DATABASE_URL)
+
+
+# ── Recommendation Weights ────────────────────────────────────────────────────
+
+VIEW_WEIGHT = 1
+BID_WEIGHT = 4
+
+ALPHA = 0.55   # collaborative score
+BETA = 0.30    # content score
+GAMMA = 0.15   # popularity score
+
+
+# ── Global Data Cache ─────────────────────────────────────────────────────────
+
+catalog = pd.DataFrame()
+train = pd.DataFrame()
+tfidf_matrix = None
+item_to_content_idx = {}
+user_seen_items = {}
+item_users = {}
+pop_map = {}
+
+
+# ── Database Loading ──────────────────────────────────────────────────────────
 
 def load_from_db():
     """
-    Load interactions and item catalog directly from Nexus PostgreSQL database.
-    Falls back to static files if DB connection fails.
+    Load item catalog and interactions directly from PostgreSQL.
+    No CSV fallback. No pickle files.
     """
-    try:
-        import sqlalchemy
-        engine = sqlalchemy.create_engine(DB_URL)
 
-        # Load item catalog from item + category tables
-        catalog_query = """
-            SELECT 
-                i.id::text          AS item_id,
-                i.name              AS item_title,
-                i.starting_price    AS avg_price,
-                c.name              AS category,
-                0                   AS popularity,
-                0                   AS n_interactions
-            FROM item i
-            LEFT JOIN category c ON i.category_id = c.id
-        """
+    catalog_query = """
+        SELECT
+            i.id::text AS item_id,
+            i.name AS item_title,
+            COALESCE(i.description, '') AS description,
+            COALESCE(c.name, '') AS category,
+            COALESCE(i.starting_price, 0) AS avg_price
+        FROM item i
+        LEFT JOIN category c ON i.category_id = c.id;
+    """
 
-        # Load interactions from bid + auction tables
-        # bid = interaction_weight 3 (strongest signal)
-        interactions_query = """
-            SELECT
-                b.bidder_id::text       AS user_id,
-                a.item_id::text         AS item_id,
-                i.name                  AS item_title,
-                3                       AS interaction_weight,
-                b.bid_time              AS interaction_timestamp,
-                b.bid_amount            AS price
-            FROM bid b
-            JOIN auction a ON b.auction_id = a.id
-            JOIN item i    ON a.item_id    = i.id
-        """
+    view_query = """
+        SELECT
+            ui.user_id::text AS user_id,
+            ui.item_id::text AS item_id,
+            i.name AS item_title,
+            1 AS interaction_weight,
+            ui.created_at AS interaction_timestamp,
+            COALESCE(i.starting_price, 0) AS price
+        FROM user_interactions ui
+        JOIN item i ON ui.item_id::text = i.id::text
+        WHERE ui.interaction_type = 'view';
+    """
 
-        catalog = pd.read_sql(catalog_query, engine)
-        train   = pd.read_sql(interactions_query, engine)
+    bid_query = """
+        SELECT
+            b.bidder_id::text AS user_id,
+            a.item_id::text AS item_id,
+            i.name AS item_title,
+            4 AS interaction_weight,
+            b.bid_time AS interaction_timestamp,
+            b.bid_amount AS price
+        FROM bid b
+        JOIN auction a ON b.auction_id = a.id
+        JOIN item i ON a.item_id = i.id;
+    """
 
-        # Calculate popularity from interaction counts
-        popularity = train.groupby("item_id")["interaction_weight"].sum().reset_index()
-        popularity.columns = ["item_id", "popularity"]
-        catalog = catalog.merge(popularity, on="item_id", how="left", suffixes=("", "_new"))
-        if "popularity_new" in catalog.columns:
-            catalog["popularity"] = catalog["popularity_new"].fillna(0)
-            catalog.drop(columns=["popularity_new"], inplace=True)
-        else:
-            catalog["popularity"] = catalog["popularity"].fillna(0)
+    db_catalog = pd.read_sql(catalog_query, engine)
 
-        print(f"DB loaded: {len(catalog):,} items | {len(train):,} interactions")
-        return catalog, train
+    views = pd.read_sql(view_query, engine)
+    bids = pd.read_sql(bid_query, engine)
 
-    except Exception as e:
-        print(f"DB connection failed: {e}")
-        print("Falling back to static files...")
-        return None, None
+    db_train = pd.concat([views, bids], ignore_index=True)
+
+    if db_catalog.empty:
+        raise RuntimeError("No items found in database.")
+
+    # If there are no interactions yet, keep empty train but API can still return popular/latest items.
+    if db_train.empty:
+        db_train = pd.DataFrame(
+            columns=[
+                "user_id",
+                "item_id",
+                "item_title",
+                "interaction_weight",
+                "interaction_timestamp",
+                "price",
+            ]
+        )
+
+    popularity = (
+        db_train.groupby("item_id")["interaction_weight"]
+        .sum()
+        .reset_index()
+        .rename(columns={"interaction_weight": "popularity"})
+    )
+
+    db_catalog = db_catalog.merge(popularity, on="item_id", how="left")
+    db_catalog["popularity"] = db_catalog["popularity"].fillna(0)
+
+    return db_catalog, db_train
 
 
-print("Loading artifacts...")
+def rebuild_indexes():
+    """
+    Build in-memory structures from latest DB data.
+    """
 
-# Try DB first, fall back to static files
-catalog, train = load_from_db()
+    global tfidf_matrix
+    global item_to_content_idx
+    global user_seen_items
+    global item_users
+    global pop_map
 
-if catalog is None or train is None:
-    catalog = pd.read_csv(f"{DATA_DIR}/item_catalog.csv")
-    train   = pd.read_csv(f"{DATA_DIR}/train.csv")
-    print(f"Static files loaded: {len(catalog):,} items | {len(train):,} interactions")
+    if catalog.empty:
+        raise RuntimeError("Catalog is empty.")
 
-with open(f"{DATA_DIR}/content_data.pkl", "rb") as f:
-    content_data = pickle.load(f)
+    # Content-based text
+    content_text = (
+        catalog["item_title"].fillna("") + " " +
+        catalog["description"].fillna("") + " " +
+        catalog["category"].fillna("")
+    )
 
-with open(f"{DATA_DIR}/cf_data.pkl", "rb") as f:
-    cf_data = pickle.load(f)
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(content_text)
 
-with open(f"{DATA_DIR}/hybrid_model_config.pkl", "rb") as f:
-    hybrid_config = pickle.load(f)
+    item_to_content_idx = {
+        item_id: idx
+        for idx, item_id in enumerate(catalog["item_id"].tolist())
+    }
 
-# ── Unpack Content Artifacts ───────────────────────────────────────────────────
+    # User seen items
+    seen = defaultdict(set)
+    item_user_weights = defaultdict(dict)
 
-sbert_emb      = content_data["sbert_embeddings"]
-cb_item_to_idx = content_data["item_to_idx"]
+    for _, row in train.iterrows():
+        user_id = str(row["user_id"])
+        item_id = str(row["item_id"])
+        weight = float(row["interaction_weight"])
 
-# ── Unpack CF Artifacts (scipy SVD) ───────────────────────────────────────────
+        seen[user_id].add(item_id)
+        item_user_weights[item_id][user_id] = item_user_weights[item_id].get(user_id, 0) + weight
 
-user_factors    = cf_data["user_factors"]
-item_factors    = cf_data["item_factors"]
-user_to_idx     = cf_data["user_to_idx"]
-item_to_idx     = cf_data["item_to_idx"]
-idx_to_item     = cf_data["idx_to_item"]
-user_seen_items = cf_data["user_seen_items"]
-all_item_ids    = cf_data["all_item_ids"]
+    user_seen_items = dict(seen)
+    item_users = dict(item_user_weights)
 
-# ── Popularity Map ─────────────────────────────────────────────────────────────
+    max_pop = catalog["popularity"].max()
+    if max_pop and max_pop > 0:
+        catalog["popularity_norm"] = catalog["popularity"] / max_pop
+    else:
+        catalog["popularity_norm"] = 0.0
 
-catalog["popularity_norm"] = catalog["popularity"] / catalog["popularity"].max()
-pop_map = dict(zip(catalog["item_id"], catalog["popularity_norm"]))
+    pop_map = dict(zip(catalog["item_id"], catalog["popularity_norm"]))
 
-ALPHA = hybrid_config.get("best_alpha", 0.5)
-BETA  = hybrid_config.get("best_beta",  0.3)
-GAMMA = hybrid_config.get("best_gamma", 0.2)
 
-print(f"Loaded. Weights: α={ALPHA}, β={BETA}, γ={GAMMA}")
-print(f"Catalog: {len(catalog):,} items | Known users: {len(user_to_idx):,}")
+def refresh_data():
+    """
+    Reload DB data and rebuild recommendation indexes.
+    """
 
-# ── Helper Functions ───────────────────────────────────────────────────────────
+    global catalog
+    global train
+
+    catalog, train = load_from_db()
+    rebuild_indexes()
+
+    print(f"DB loaded: {len(catalog):,} items | {len(train):,} interactions")
+
+
+# Load once at startup
+refresh_data()
+
+
+# ── Recommendation Helpers ────────────────────────────────────────────────────
+
+def normalize_scores(score_dict):
+    if not score_dict:
+        return {}
+
+    values = np.array(list(score_dict.values()), dtype=float)
+
+    min_v = values.min()
+    max_v = values.max()
+
+    if max_v == min_v:
+        return {k: 0.0 for k in score_dict.keys()}
+
+    return {
+        k: float((v - min_v) / (max_v - min_v))
+        for k, v in score_dict.items()
+    }
+
 
 def get_cf_scores(user_id: str, candidates: list) -> dict:
-    if user_id not in user_to_idx:
+    """
+    Simple dynamic item-based collaborative filtering from DB interactions.
+
+    Logic:
+    - Look at items the user has interacted with.
+    - Find other items interacted with by similar users.
+    - Score candidates by overlap strength.
+    """
+
+    user_id = str(user_id)
+
+    if user_id not in user_seen_items:
         return {item: 0.0 for item in candidates}
 
-    u_idx      = user_to_idx[user_id]
-    u_vector   = user_factors[u_idx]
-    cand_items = [iid for iid in candidates if iid in item_to_idx]
-    cand_idxs  = np.array([item_to_idx[iid] for iid in cand_items])
+    user_history = train[train["user_id"].astype(str) == user_id]
 
-    if len(cand_idxs) == 0:
+    if user_history.empty:
         return {item: 0.0 for item in candidates}
 
-    raw    = item_factors[cand_idxs] @ u_vector
-    min_s, max_s = raw.min(), raw.max()
-    rng    = max_s - min_s if max_s != min_s else 1.0
-    normed = (raw - min_s) / rng
+    raw_scores = defaultdict(float)
 
-    score_map = dict(zip(cand_items, normed.tolist()))
-    return {item: score_map.get(item, 0.0) for item in candidates}
+    for _, hist_row in user_history.iterrows():
+        hist_item = str(hist_row["item_id"])
+        hist_weight = float(hist_row["interaction_weight"])
+
+        users_for_hist_item = item_users.get(hist_item, {})
+
+        for candidate in candidates:
+            candidate = str(candidate)
+            users_for_candidate = item_users.get(candidate, {})
+
+            if not users_for_candidate:
+                continue
+
+            common_users = set(users_for_hist_item.keys()) & set(users_for_candidate.keys())
+
+            if not common_users:
+                continue
+
+            similarity = len(common_users) / max(
+                len(users_for_hist_item),
+                len(users_for_candidate),
+                1
+            )
+
+            raw_scores[candidate] += similarity * hist_weight
+
+    normed = normalize_scores(raw_scores)
+
+    return {item: normed.get(item, 0.0) for item in candidates}
 
 
 def get_content_scores(user_id: str, candidates: list) -> dict:
-    history = train[train["user_id"] == user_id]
+    """
+    Content-based filtering using TF-IDF similarity.
+    Builds a user profile from items the user interacted with.
+    """
+
+    user_id = str(user_id)
+
+    history = train[train["user_id"].astype(str) == user_id]
+
     if history.empty:
         return {item: 0.0 for item in candidates}
 
-    profile = np.zeros(sbert_emb.shape[1])
-    total_w = 0.0
-    for _, row in history.iterrows():
-        if row["item_id"] in cb_item_to_idx:
-            idx      = cb_item_to_idx[row["item_id"]]
-            profile += sbert_emb[idx] * row["interaction_weight"]
-            total_w += row["interaction_weight"]
+    profile = None
+    total_weight = 0.0
 
-    if total_w == 0:
+    for _, row in history.iterrows():
+        item_id = str(row["item_id"])
+        weight = float(row["interaction_weight"])
+
+        if item_id not in item_to_content_idx:
+            continue
+
+        idx = item_to_content_idx[item_id]
+        item_vec = tfidf_matrix[idx] * weight
+
+        if profile is None:
+            profile = item_vec
+        else:
+            profile = profile + item_vec
+
+        total_weight += weight
+
+    if profile is None or total_weight == 0:
         return {item: 0.0 for item in candidates}
 
-    profile = (profile / total_w).reshape(1, -1)
-    scores  = {}
-    for iid in candidates:
-        if iid in cb_item_to_idx:
-            idx = cb_item_to_idx[iid]
-            scores[iid] = float(cosine_similarity(profile, sbert_emb[idx].reshape(1, -1))[0][0])
-        else:
-            scores[iid] = 0.0
-    return scores
+    profile = profile / total_weight
+
+    candidate_indices = []
+    candidate_ids = []
+
+    for item_id in candidates:
+        item_id = str(item_id)
+        if item_id in item_to_content_idx:
+            candidate_ids.append(item_id)
+            candidate_indices.append(item_to_content_idx[item_id])
+
+    if not candidate_indices:
+        return {item: 0.0 for item in candidates}
+
+    candidate_matrix = tfidf_matrix[candidate_indices]
+    raw = cosine_similarity(profile, candidate_matrix).flatten()
+
+    score_map = dict(zip(candidate_ids, raw.tolist()))
+
+    return {item: float(score_map.get(item, 0.0)) for item in candidates}
 
 
 def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
-    seen       = user_seen_items.get(user_id, set())
-    candidates = [iid for iid in catalog["item_id"] if iid not in seen]
+    user_id = str(user_id)
 
-    cf_scores      = get_cf_scores(user_id, candidates)
+    seen = user_seen_items.get(user_id, set())
+    candidates = [
+        str(iid)
+        for iid in catalog["item_id"].astype(str).tolist()
+        if str(iid) not in seen
+    ]
+
+    if not candidates:
+        return []
+
+    cf_scores = get_cf_scores(user_id, candidates)
     content_scores = get_content_scores(user_id, candidates)
 
     results = []
+
     for iid in candidates:
-        cf_s  = cf_scores.get(iid, 0.0)
-        cb_s  = content_scores.get(iid, 0.0)
+        cf_s = cf_scores.get(iid, 0.0)
+        cb_s = content_scores.get(iid, 0.0)
         pop_s = pop_map.get(iid, 0.0)
+
         final = ALPHA * cf_s + BETA * cb_s + GAMMA * pop_s
+
         results.append({
-            "item_id":       iid,
-            "score":         round(final, 4),
-            "cf_score":      round(cf_s, 4),
-            "content_score": round(cb_s, 4),
-            "pop_score":     round(pop_s, 4),
+            "item_id": iid,
+            "score": round(float(final), 4),
+            "cf_score": round(float(cf_s), 4),
+            "content_score": round(float(cb_s), 4),
+            "pop_score": round(float(pop_s), 4),
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    top     = results[:top_n]
-    cat_map = catalog.set_index("item_id")[["item_title", "avg_price", "popularity"]].to_dict("index")
+
+    top = results[:top_n]
+
+    cat_map = catalog.set_index("item_id")[
+        ["item_title", "avg_price", "category", "popularity"]
+    ].to_dict("index")
 
     for r in top:
-        info         = cat_map.get(r["item_id"], {})
+        info = cat_map.get(r["item_id"], {})
         r["item_title"] = str(info.get("item_title", "Unknown"))
-        r["avg_price"]  = round(float(info.get("avg_price", 0)), 2)
+        r["category"] = str(info.get("category", ""))
+        r["avg_price"] = round(float(info.get("avg_price", 0)), 2)
         r["popularity"] = int(info.get("popularity", 0))
 
     return top
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"service": "Nexus Recommendation API", "version": "1.0.0",
-            "docs": "/docs", "endpoints": ["/recommend", "/popular", "/similar/{item_id}", "/users", "/health"]}
+    return {
+        "service": "Nexus Recommendation API",
+        "version": "2.0.0",
+        "mode": "database-only",
+        "docs": "/docs",
+        "endpoints": [
+            "/recommend",
+            "/popular",
+            "/similar/{item_id}",
+            "/users",
+            "/items",
+            "/refresh",
+            "/health",
+        ],
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "catalog_size": len(catalog),
-            "known_users": len(user_to_idx), "weights": {"alpha": ALPHA, "beta": BETA, "gamma": GAMMA}}
+    return {
+        "status": "ok",
+        "mode": "database-only",
+        "catalog_size": len(catalog),
+        "interaction_count": len(train),
+        "known_users": len(user_seen_items),
+        "weights": {
+            "view": VIEW_WEIGHT,
+            "bid": BID_WEIGHT,
+            "alpha": ALPHA,
+            "beta": BETA,
+            "gamma": GAMMA,
+        },
+    }
+
+
+@app.post("/refresh")
+def refresh():
+    """
+    Manually reload latest DB data.
+    Use this after inserting new seed data or new interactions.
+    """
+    try:
+        refresh_data()
+        return {
+            "status": "refreshed",
+            "catalog_size": len(catalog),
+            "interaction_count": len(train),
+            "known_users": len(user_seen_items),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/recommend")
-def recommend(user_id: str = Query(...), top_n: int = Query(10, ge=1, le=50)):
-    """Personalized hybrid recommendations for a user."""
+def recommend(
+    user_id: str = Query(...),
+    top_n: int = Query(10, ge=1, le=50),
+):
     try:
         recs = hybrid_recommend(user_id, top_n=top_n)
-        return {"user_id": user_id, "cold_start": user_id not in user_to_idx,
-                "count": len(recs), "recommendations": recs}
+
+        return {
+            "user_id": user_id,
+            "cold_start": str(user_id) not in user_seen_items,
+            "count": len(recs),
+            "recommendations": recs,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/popular")
 def popular(top_n: int = Query(10, ge=1, le=50)):
-    """Most popular items — fallback for cold start."""
-    top = catalog.nlargest(top_n, "popularity")[["item_id","item_title","avg_price","popularity"]].copy()
+    top = catalog.nlargest(top_n, "popularity")[
+        ["item_id", "item_title", "category", "avg_price", "popularity"]
+    ].copy()
+
     top["popularity"] = top["popularity"].astype(int)
-    top["avg_price"]  = top["avg_price"].astype(float)
-    return {"count": len(top), "items": top.to_dict("records")}
+    top["avg_price"] = top["avg_price"].astype(float)
+
+    return {
+        "count": len(top),
+        "items": top.to_dict("records"),
+    }
 
 
 @app.get("/similar/{item_id}")
-def similar_items(item_id: str, top_n: int = Query(10, ge=1, le=50)):
-    """Items similar to a given item using SBERT cosine similarity."""
-    item_id = item_id.upper()
-    if item_id not in cb_item_to_idx:
+def similar_items(
+    item_id: str,
+    top_n: int = Query(10, ge=1, le=50),
+):
+    item_id = str(item_id)
+
+    if item_id not in item_to_content_idx:
         raise HTTPException(status_code=404, detail=f"Item '{item_id}' not found.")
 
-    idx    = cb_item_to_idx[item_id]
-    vec    = sbert_emb[idx].reshape(1, -1)
-    scores = cosine_similarity(vec, sbert_emb).flatten()
+    idx = item_to_content_idx[item_id]
+    vec = tfidf_matrix[idx]
+    scores = cosine_similarity(vec, tfidf_matrix).flatten()
+
     scores[idx] = 0
+
     top_idx = np.argsort(scores)[::-1][:top_n]
-    inv_map = {v: k for k, v in cb_item_to_idx.items()}
+
+    inv_map = {v: k for k, v in item_to_content_idx.items()}
     cat_map = catalog.set_index("item_id").to_dict("index")
 
-    results = [{"item_id": inv_map[i], "item_title": cat_map.get(inv_map[i], {}).get("item_title",""),
-                "avg_price": round(float(cat_map.get(inv_map[i],{}).get("avg_price",0)),2),
-                "similarity": round(float(scores[i]),4)} for i in top_idx]
+    results = []
 
-    return {"seed_item": {"item_id": item_id, "item_title": cat_map.get(item_id,{}).get("item_title","")},
-            "count": len(results), "similar": results}
+    for i in top_idx:
+        similar_item_id = inv_map[i]
+        info = cat_map.get(similar_item_id, {})
+
+        results.append({
+            "item_id": similar_item_id,
+            "item_title": str(info.get("item_title", "")),
+            "category": str(info.get("category", "")),
+            "avg_price": round(float(info.get("avg_price", 0)), 2),
+            "similarity": round(float(scores[i]), 4),
+        })
+
+    return {
+        "seed_item": {
+            "item_id": item_id,
+            "item_title": cat_map.get(item_id, {}).get("item_title", ""),
+        },
+        "count": len(results),
+        "similar": results,
+    }
 
 
 @app.get("/users")
 def list_users(limit: int = Query(20, ge=1, le=200)):
-    users = [str(u) for u in list(user_to_idx.keys())[:limit]]
-    return {"count": len(users), "users": users}
+    users = list(user_seen_items.keys())[:limit]
+    return {
+        "count": len(users),
+        "users": users,
+    }
 
 
 @app.get("/items")
 def list_items(limit: int = Query(20, ge=1, le=200)):
-    items = catalog.head(limit)[["item_id","item_title","avg_price","popularity"]].copy()
+    items = catalog.head(limit)[
+        ["item_id", "item_title", "category", "avg_price", "popularity"]
+    ].copy()
+
     items["popularity"] = items["popularity"].astype(int)
-    items["avg_price"]  = items["avg_price"].astype(float)
-    return {"count": len(items), "items": items.to_dict("records")}
+    items["avg_price"] = items["avg_price"].astype(float)
+
+    return {
+        "count": len(items),
+        "items": items.to_dict("records"),
+    }
