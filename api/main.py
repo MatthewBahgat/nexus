@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
@@ -38,6 +40,7 @@ NEXUS_API_TOKEN = os.getenv("NEXUS_API_TOKEN") or os.getenv("API_BEARER_TOKEN")
 NEXUS_API_TIMEOUT = float(os.getenv("NEXUS_API_TIMEOUT", "20"))
 NEXUS_PAGE_LIMIT = int(os.getenv("NEXUS_PAGE_LIMIT", "100"))
 NEXUS_INTERACTION_LIMIT = int(os.getenv("NEXUS_INTERACTION_LIMIT", "500"))
+NEXUS_AUTO_REFRESH_MINUTES = float(os.getenv("NEXUS_AUTO_REFRESH_MINUTES", "5"))
 
 
 # Recommendation Weights
@@ -59,6 +62,8 @@ item_to_content_idx = {}
 user_seen_items = {}
 item_users = {}
 pop_map = {}
+refresh_lock = threading.Lock()
+auto_refresh_started = False
 
 
 # API Loading
@@ -356,14 +361,45 @@ def refresh_data():
     global catalog
     global train
 
-    catalog, train = load_from_api()
-    rebuild_indexes()
+    with refresh_lock:
+        catalog, train = load_from_api()
+        rebuild_indexes()
 
     print(f"API loaded: {len(catalog):,} items | {len(train):,} interactions")
 
 
 # Load once at startup
 refresh_data()
+
+
+def auto_refresh_loop():
+    interval_seconds = max(NEXUS_AUTO_REFRESH_MINUTES, 0) * 60
+
+    if interval_seconds <= 0:
+        print("Auto refresh disabled.")
+        return
+
+    while True:
+        time.sleep(interval_seconds)
+
+        try:
+            refresh_data()
+            print(f"Auto refresh complete. Next refresh in {NEXUS_AUTO_REFRESH_MINUTES:g} minutes.")
+        except Exception as exc:
+            print(f"Auto refresh failed: {exc}")
+
+
+@app.on_event("startup")
+def start_auto_refresh():
+    global auto_refresh_started
+
+    if auto_refresh_started or NEXUS_AUTO_REFRESH_MINUTES <= 0:
+        return
+
+    auto_refresh_started = True
+    thread = threading.Thread(target=auto_refresh_loop, daemon=True)
+    thread.start()
+    print(f"Auto refresh enabled every {NEXUS_AUTO_REFRESH_MINUTES:g} minutes.")
 
 
 # Recommendation Helpers
@@ -629,6 +665,7 @@ def health():
         "interaction_count": len(train),
         "known_users": len(user_seen_items),
         "authenticated_interactions": bool(NEXUS_API_TOKEN),
+        "auto_refresh_minutes": NEXUS_AUTO_REFRESH_MINUTES,
         "default_weights": {
             "view": VIEW_WEIGHT,
             "bid": BID_WEIGHT,
