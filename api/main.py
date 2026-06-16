@@ -45,9 +45,9 @@ NEXUS_INTERACTION_LIMIT = int(os.getenv("NEXUS_INTERACTION_LIMIT", "500"))
 VIEW_WEIGHT = 1
 BID_WEIGHT = 4
 
-ALPHA = 0.55   # collaborative score
-BETA = 0.30    # content score
-GAMMA = 0.15   # popularity score
+ALPHA = 0.55   # default collaborative score
+BETA = 0.30    # default content score
+GAMMA = 0.15   # default popularity score
 
 
 # Global Data Cache
@@ -386,6 +386,50 @@ def normalize_scores(score_dict):
     }
 
 
+def get_dynamic_weights(user_id: str) -> dict:
+    """
+    Shift the blend by how much behavior we know for this user.
+    Cold-start users lean on content and popularity; active users lean on CF.
+    """
+
+    history_count = len(user_seen_items.get(str(user_id), set()))
+
+    if history_count == 0:
+        return {
+            "alpha": 0.0,
+            "beta": 0.45,
+            "gamma": 0.55,
+            "history_count": history_count,
+            "profile": "cold_start",
+        }
+
+    if history_count < 3:
+        return {
+            "alpha": 0.20,
+            "beta": 0.45,
+            "gamma": 0.35,
+            "history_count": history_count,
+            "profile": "new_user",
+        }
+
+    if history_count < 10:
+        return {
+            "alpha": 0.45,
+            "beta": 0.35,
+            "gamma": 0.20,
+            "history_count": history_count,
+            "profile": "warming_up",
+        }
+
+    return {
+        "alpha": 0.60,
+        "beta": 0.30,
+        "gamma": 0.10,
+        "history_count": history_count,
+        "profile": "active_user",
+    }
+
+
 def get_cf_scores(user_id: str, candidates: list) -> dict:
     """
     Simple dynamic item-based collaborative filtering from API interactions.
@@ -494,6 +538,7 @@ def get_content_scores(user_id: str, candidates: list) -> dict:
 
 def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
     user_id = str(user_id)
+    weights = get_dynamic_weights(user_id)
 
     seen = user_seen_items.get(user_id, set())
     candidates = [
@@ -515,7 +560,11 @@ def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
         cb_s = content_scores.get(iid, 0.0)
         pop_s = pop_map.get(iid, 0.0)
 
-        final = ALPHA * cf_s + BETA * cb_s + GAMMA * pop_s
+        final = (
+            weights["alpha"] * cf_s +
+            weights["beta"] * cb_s +
+            weights["gamma"] * pop_s
+        )
 
         results.append({
             "item_id": iid,
@@ -523,6 +572,11 @@ def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
             "cf_score": round(float(cf_s), 4),
             "content_score": round(float(cb_s), 4),
             "pop_score": round(float(pop_s), 4),
+            "weights": {
+                "alpha": weights["alpha"],
+                "beta": weights["beta"],
+                "gamma": weights["gamma"],
+            },
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -575,7 +629,7 @@ def health():
         "interaction_count": len(train),
         "known_users": len(user_seen_items),
         "authenticated_interactions": bool(NEXUS_API_TOKEN),
-        "weights": {
+        "default_weights": {
             "view": VIEW_WEIGHT,
             "bid": BID_WEIGHT,
             "alpha": ALPHA,
@@ -608,11 +662,19 @@ def recommend(
     top_n: int = Query(10, ge=1, le=50),
 ):
     try:
+        weights = get_dynamic_weights(user_id)
         recs = hybrid_recommend(user_id, top_n=top_n)
 
         return {
             "user_id": user_id,
             "cold_start": str(user_id) not in user_seen_items,
+            "profile": weights["profile"],
+            "history_count": weights["history_count"],
+            "weights": {
+                "alpha": weights["alpha"],
+                "beta": weights["beta"],
+                "gamma": weights["gamma"],
+            },
             "count": len(recs),
             "recommendations": recs,
         }
