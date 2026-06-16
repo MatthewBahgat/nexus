@@ -1,21 +1,26 @@
+import json
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urljoin
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 
-# ── App Setup ─────────────────────────────────────────────────────────────────
+# App Setup
 
 app = FastAPI(
     title="Nexus Recommendation API",
-    description="Database-driven recommendation system for the Nexus auction platform",
-    version="2.0.0"
+    description="API-driven recommendation system for the Nexus auction platform",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -26,20 +31,16 @@ app.add_middleware(
 )
 
 
-# ── Database Config ───────────────────────────────────────────────────────────
+# Upstream API Config
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL is missing. Example: "
-        "postgresql://postgres:postgres@postgres:5432/nexus"
-    )
-
-engine = create_engine(DATABASE_URL)
+NEXUS_API_BASE_URL = os.getenv("NEXUS_API_BASE_URL", "https://nexus.tidygram.site").rstrip("/")
+NEXUS_API_TOKEN = os.getenv("NEXUS_API_TOKEN") or os.getenv("API_BEARER_TOKEN")
+NEXUS_API_TIMEOUT = float(os.getenv("NEXUS_API_TIMEOUT", "20"))
+NEXUS_PAGE_LIMIT = int(os.getenv("NEXUS_PAGE_LIMIT", "100"))
+NEXUS_INTERACTION_LIMIT = int(os.getenv("NEXUS_INTERACTION_LIMIT", "500"))
 
 
-# ── Recommendation Weights ────────────────────────────────────────────────────
+# Recommendation Weights
 
 VIEW_WEIGHT = 1
 BID_WEIGHT = 4
@@ -49,7 +50,7 @@ BETA = 0.30    # content score
 GAMMA = 0.15   # popularity score
 
 
-# ── Global Data Cache ─────────────────────────────────────────────────────────
+# Global Data Cache
 
 catalog = pd.DataFrame()
 train = pd.DataFrame()
@@ -60,90 +61,245 @@ item_users = {}
 pop_map = {}
 
 
-# ── Database Loading ──────────────────────────────────────────────────────────
+# API Loading
 
-def load_from_db():
-    """
-    Load item catalog and interactions directly from PostgreSQL.
-    No CSV fallback. No pickle files.
-    """
+def api_headers(authenticated: bool = False) -> dict:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "nexus-recommender/2.1",
+    }
 
-    catalog_query = """
-        SELECT
-            i.id::text AS item_id,
-            i.name AS item_title,
-            COALESCE(i.description, '') AS description,
-            COALESCE(c.name, '') AS category,
-            COALESCE(i.starting_price, 0) AS avg_price
-        FROM item i
-        LEFT JOIN category c ON i.category_id = c.id;
-    """
+    if authenticated and NEXUS_API_TOKEN:
+        headers["Authorization"] = f"Bearer {NEXUS_API_TOKEN}"
 
-    view_query = """
-        SELECT
-            ui.user_id::text AS user_id,
-            ui.item_id::text AS item_id,
-            i.name AS item_title,
-            1 AS interaction_weight,
-            ui.created_at AS interaction_timestamp,
-            COALESCE(i.starting_price, 0) AS price
-        FROM user_interactions ui
-        JOIN item i ON ui.item_id::text = i.id::text
-        WHERE ui.interaction_type = 'view';
-    """
+    return headers
 
-    bid_query = """
-        SELECT
-            b.bidder_id::text AS user_id,
-            a.item_id::text AS item_id,
-            i.name AS item_title,
-            4 AS interaction_weight,
-            b.bid_time AS interaction_timestamp,
-            b.bid_amount AS price
-        FROM bid b
-        JOIN auction a ON b.auction_id = a.id
-        JOIN item i ON a.item_id = i.id;
-    """
 
-    db_catalog = pd.read_sql(catalog_query, engine)
+def api_get(path: str, params: dict | None = None, authenticated: bool = False) -> dict:
+    query = f"?{urlencode(params or {})}" if params else ""
+    url = urljoin(f"{NEXUS_API_BASE_URL}/", path.lstrip("/")) + query
+    request = Request(url, headers=api_headers(authenticated=authenticated), method="GET")
 
-    views = pd.read_sql(view_query, engine)
-    bids = pd.read_sql(bid_query, engine)
+    try:
+        with urlopen(request, timeout=NEXUS_API_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET {path} failed with {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"GET {path} failed: {exc.reason}") from exc
 
-    db_train = pd.concat([views, bids], ignore_index=True)
+
+def fetch_paginated(
+    path: str,
+    *,
+    limit: int = NEXUS_PAGE_LIMIT,
+    authenticated: bool = False,
+    extra_params: dict | None = None,
+) -> list[dict]:
+    records = []
+    page = 1
+
+    while True:
+        params = {"page": page, "limit": limit}
+        if extra_params:
+            params.update(extra_params)
+
+        payload = api_get(path, params=params, authenticated=authenticated)
+        data = payload.get("data") or payload.get("items") or []
+        records.extend(data)
+
+        meta = payload.get("meta") or {}
+        total_pages = int(meta.get("totalPages") or meta.get("total_pages") or page)
+
+        if page >= total_pages or not data:
+            break
+
+        page += 1
+
+    return records
+
+
+def first_value(source: dict, *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in source and source[key] is not None:
+            return source[key]
+    return default
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_timestamp(value: Any) -> Any:
+    if value:
+        return value
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_categories() -> dict:
+    categories = fetch_paginated("/categories")
+    return {str(category.get("id")): category for category in categories}
+
+
+def item_to_catalog_row(item: dict, categories: dict) -> dict:
+    category_id = first_value(item, "categoryId", "category_id")
+    category = item.get("category") or categories.get(str(category_id), {})
+
+    return {
+        "item_id": str(item.get("id")),
+        "item_title": str(first_value(item, "name", "title", default="")),
+        "description": str(first_value(item, "description", default="") or ""),
+        "category": str(first_value(category, "name", default="") or ""),
+        "avg_price": as_float(first_value(item, "startingPrice", "starting_price", "buyNowPrice", "buy_now_price")),
+        "popularity": 0.0,
+    }
+
+
+def load_catalog_from_api() -> pd.DataFrame:
+    categories = load_categories()
+    items = fetch_paginated("/items")
+
+    if not items:
+        raise RuntimeError("No items returned by the Nexus API.")
+
+    rows = [item_to_catalog_row(item, categories) for item in items]
+    db_catalog = pd.DataFrame(rows).drop_duplicates(subset=["item_id"], keep="last")
 
     if db_catalog.empty:
-        raise RuntimeError("No items found in database.")
+        raise RuntimeError("No usable items returned by the Nexus API.")
 
-    # If there are no interactions yet, keep empty train but API can still return popular/latest items.
-    if db_train.empty:
-        db_train = pd.DataFrame(
-            columns=[
-                "user_id",
-                "item_id",
-                "item_title",
-                "interaction_weight",
-                "interaction_timestamp",
-                "price",
-            ]
+    return db_catalog
+
+
+def interaction_to_train_row(interaction: dict) -> dict | None:
+    user_id = first_value(interaction, "userId", "user_id", "customerId", "customer_id")
+    item_id = first_value(interaction, "itemId", "item_id")
+
+    item = interaction.get("item") or {}
+    auction = interaction.get("auction") or {}
+
+    if item_id is None:
+        item_id = first_value(item, "id")
+    if item_id is None:
+        item_id = first_value(auction, "itemId", "item_id")
+
+    if user_id is None or item_id is None:
+        return None
+
+    interaction_type = str(
+        first_value(interaction, "interactionType", "interaction_type", "type", default="view")
+    ).lower()
+    default_weight = BID_WEIGHT if "bid" in interaction_type else VIEW_WEIGHT
+    weight = as_float(first_value(interaction, "weight", "score", default=default_weight), default_weight)
+
+    return {
+        "user_id": str(user_id),
+        "item_id": str(item_id),
+        "item_title": str(first_value(item, "name", "title", default="")),
+        "interaction_weight": weight,
+        "interaction_timestamp": normalize_timestamp(
+            first_value(interaction, "createdAt", "created_at", "timestamp")
+        ),
+        "price": as_float(first_value(interaction, "price", "amount", "bidAmount", "bid_amount")),
+    }
+
+
+def load_interactions_from_api() -> pd.DataFrame:
+    columns = [
+        "user_id",
+        "item_id",
+        "item_title",
+        "interaction_weight",
+        "interaction_timestamp",
+        "price",
+    ]
+
+    if not NEXUS_API_TOKEN:
+        return pd.DataFrame(columns=columns)
+
+    interactions = fetch_paginated(
+        "/recommender-interactions",
+        limit=NEXUS_INTERACTION_LIMIT,
+        authenticated=True,
+    )
+    rows = []
+
+    for interaction in interactions:
+        row = interaction_to_train_row(interaction)
+        if row:
+            rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def load_auction_popularity() -> dict:
+    popularity = defaultdict(float)
+
+    try:
+        auctions = fetch_paginated("/auctions")
+    except RuntimeError:
+        return {}
+
+    for auction in auctions:
+        item_id = first_value(auction, "itemId", "item_id")
+        if item_id is None:
+            continue
+
+        status = str(first_value(auction, "status", default="")).lower()
+        status_boost = {
+            "live": 3.0,
+            "ended": 2.0,
+            "scheduled": 1.0,
+        }.get(status, 0.5)
+        highest_price = as_float(first_value(auction, "currentHighestPrice", "current_highest_price"))
+        reserve_price = as_float(first_value(auction, "reservePrice", "reserve_price"))
+
+        popularity[str(item_id)] += status_boost + max(highest_price, reserve_price, 0.0) / 1000.0
+
+    return dict(popularity)
+
+
+def load_from_api():
+    """
+    Load item catalog and recommendation interactions from the deployed Nexus API.
+    Public catalog data comes from /items and /categories. Personalized interaction
+    data comes from /recommender-interactions when NEXUS_API_TOKEN is provided.
+    """
+
+    db_catalog = load_catalog_from_api()
+    db_train = load_interactions_from_api()
+
+    if not db_train.empty:
+        popularity = (
+            db_train.groupby("item_id")["interaction_weight"]
+            .sum()
+            .reset_index()
+            .rename(columns={"interaction_weight": "popularity"})
         )
 
-    popularity = (
-        db_train.groupby("item_id")["interaction_weight"]
-        .sum()
-        .reset_index()
-        .rename(columns={"interaction_weight": "popularity"})
-    )
-
-    db_catalog = db_catalog.merge(popularity, on="item_id", how="left")
-    db_catalog["popularity"] = db_catalog["popularity"].fillna(0)
+        db_catalog = db_catalog.drop(columns=["popularity"], errors="ignore")
+        db_catalog = db_catalog.merge(popularity, on="item_id", how="left")
+        db_catalog["popularity"] = db_catalog["popularity"].fillna(0.0)
+    else:
+        auction_popularity = load_auction_popularity()
+        db_catalog["popularity"] = (
+            db_catalog["item_id"].astype(str).map(auction_popularity).fillna(0.0)
+        )
 
     return db_catalog, db_train
 
 
 def rebuild_indexes():
     """
-    Build in-memory structures from latest DB data.
+    Build in-memory structures from latest API data.
     """
 
     global tfidf_matrix
@@ -155,7 +311,6 @@ def rebuild_indexes():
     if catalog.empty:
         raise RuntimeError("Catalog is empty.")
 
-    # Content-based text
     content_text = (
         catalog["item_title"].fillna("") + " " +
         catalog["description"].fillna("") + " " +
@@ -167,10 +322,9 @@ def rebuild_indexes():
 
     item_to_content_idx = {
         item_id: idx
-        for idx, item_id in enumerate(catalog["item_id"].tolist())
+        for idx, item_id in enumerate(catalog["item_id"].astype(str).tolist())
     }
 
-    # User seen items
     seen = defaultdict(set)
     item_user_weights = defaultdict(dict)
 
@@ -191,28 +345,28 @@ def rebuild_indexes():
     else:
         catalog["popularity_norm"] = 0.0
 
-    pop_map = dict(zip(catalog["item_id"], catalog["popularity_norm"]))
+    pop_map = dict(zip(catalog["item_id"].astype(str), catalog["popularity_norm"]))
 
 
 def refresh_data():
     """
-    Reload DB data and rebuild recommendation indexes.
+    Reload API data and rebuild recommendation indexes.
     """
 
     global catalog
     global train
 
-    catalog, train = load_from_db()
+    catalog, train = load_from_api()
     rebuild_indexes()
 
-    print(f"DB loaded: {len(catalog):,} items | {len(train):,} interactions")
+    print(f"API loaded: {len(catalog):,} items | {len(train):,} interactions")
 
 
 # Load once at startup
 refresh_data()
 
 
-# ── Recommendation Helpers ────────────────────────────────────────────────────
+# Recommendation Helpers
 
 def normalize_scores(score_dict):
     if not score_dict:
@@ -234,12 +388,7 @@ def normalize_scores(score_dict):
 
 def get_cf_scores(user_id: str, candidates: list) -> dict:
     """
-    Simple dynamic item-based collaborative filtering from DB interactions.
-
-    Logic:
-    - Look at items the user has interacted with.
-    - Find other items interacted with by similar users.
-    - Score candidates by overlap strength.
+    Simple dynamic item-based collaborative filtering from API interactions.
     """
 
     user_id = str(user_id)
@@ -275,7 +424,7 @@ def get_cf_scores(user_id: str, candidates: list) -> dict:
             similarity = len(common_users) / max(
                 len(users_for_hist_item),
                 len(users_for_candidate),
-                1
+                1,
             )
 
             raw_scores[candidate] += similarity * hist_weight
@@ -389,19 +538,20 @@ def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
         r["item_title"] = str(info.get("item_title", "Unknown"))
         r["category"] = str(info.get("category", ""))
         r["avg_price"] = round(float(info.get("avg_price", 0)), 2)
-        r["popularity"] = int(info.get("popularity", 0))
+        r["popularity"] = round(float(info.get("popularity", 0)), 4)
 
     return top
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# Routes
 
 @app.get("/")
 def root():
     return {
         "service": "Nexus Recommendation API",
-        "version": "2.0.0",
-        "mode": "database-only",
+        "version": "2.1.0",
+        "mode": "api",
+        "upstream_api": NEXUS_API_BASE_URL,
         "docs": "/docs",
         "endpoints": [
             "/recommend",
@@ -419,10 +569,12 @@ def root():
 def health():
     return {
         "status": "ok",
-        "mode": "database-only",
+        "mode": "api",
+        "upstream_api": NEXUS_API_BASE_URL,
         "catalog_size": len(catalog),
         "interaction_count": len(train),
         "known_users": len(user_seen_items),
+        "authenticated_interactions": bool(NEXUS_API_TOKEN),
         "weights": {
             "view": VIEW_WEIGHT,
             "bid": BID_WEIGHT,
@@ -436,8 +588,7 @@ def health():
 @app.post("/refresh")
 def refresh():
     """
-    Manually reload latest DB data.
-    Use this after inserting new seed data or new interactions.
+    Manually reload latest API data.
     """
     try:
         refresh_data()
@@ -475,7 +626,7 @@ def popular(top_n: int = Query(10, ge=1, le=50)):
         ["item_id", "item_title", "category", "avg_price", "popularity"]
     ].copy()
 
-    top["popularity"] = top["popularity"].astype(int)
+    top["popularity"] = top["popularity"].astype(float)
     top["avg_price"] = top["avg_price"].astype(float)
 
     return {
@@ -544,7 +695,7 @@ def list_items(limit: int = Query(20, ge=1, le=200)):
         ["item_id", "item_title", "category", "avg_price", "popularity"]
     ].copy()
 
-    items["popularity"] = items["popularity"].astype(int)
+    items["popularity"] = items["popularity"].astype(float)
     items["avg_price"] = items["avg_price"].astype(float)
 
     return {
