@@ -34,12 +34,37 @@ app.add_middleware(
 )
 
 
+def parse_admin_secret(secret: str | None) -> tuple[str | None, str | None, str | None]:
+    if not secret:
+        return None, None, None
+
+    secret = secret.strip()
+
+    try:
+        parsed = json.loads(secret)
+        if isinstance(parsed, dict):
+            token = parsed.get("accessToken") or parsed.get("access_token") or parsed.get("token")
+            email = parsed.get("email") or parsed.get("username")
+            password = parsed.get("password")
+            return token, email, password
+    except json.JSONDecodeError:
+        pass
+
+    if ":" in secret and "@" in secret.split(":", 1)[0]:
+        email, password = secret.split(":", 1)
+        return None, email.strip(), password.strip()
+
+    return secret, None, None
+
+
 # Upstream API Config
 
+ADMIN_SECRET = os.getenv("ADMIN") or os.getenv("NEXUS_ADMIN")
+ADMIN_TOKEN, ADMIN_EMAIL, ADMIN_PASSWORD = parse_admin_secret(ADMIN_SECRET)
 NEXUS_API_BASE_URL = os.getenv("NEXUS_API_BASE_URL", "https://nexus.tidygram.site").rstrip("/")
-NEXUS_API_TOKEN = os.getenv("NEXUS_API_TOKEN") or os.getenv("API_BEARER_TOKEN")
-NEXUS_API_EMAIL = os.getenv("NEXUS_API_EMAIL") or os.getenv("NEXUS_ADMIN_EMAIL")
-NEXUS_API_PASSWORD = os.getenv("NEXUS_API_PASSWORD") or os.getenv("NEXUS_ADMIN_PASSWORD")
+NEXUS_API_TOKEN = os.getenv("NEXUS_API_TOKEN") or os.getenv("API_BEARER_TOKEN") or ADMIN_TOKEN
+NEXUS_API_EMAIL = os.getenv("NEXUS_API_EMAIL") or os.getenv("NEXUS_ADMIN_EMAIL") or ADMIN_EMAIL
+NEXUS_API_PASSWORD = os.getenv("NEXUS_API_PASSWORD") or os.getenv("NEXUS_ADMIN_PASSWORD") or ADMIN_PASSWORD
 NEXUS_API_TIMEOUT = float(os.getenv("NEXUS_API_TIMEOUT", "20"))
 NEXUS_PAGE_LIMIT = int(os.getenv("NEXUS_PAGE_LIMIT", "100"))
 NEXUS_INTERACTION_LIMIT = int(os.getenv("NEXUS_INTERACTION_LIMIT", "500"))
@@ -773,6 +798,7 @@ def health():
         "known_users": len(user_seen_items),
         "authenticated_interactions": bool(get_access_token_safe()),
         "auth_mode": "token" if NEXUS_API_TOKEN else "login" if NEXUS_API_EMAIL else "none",
+        "admin_secret_configured": bool(ADMIN_SECRET),
         "auto_refresh_minutes": NEXUS_AUTO_REFRESH_MINUTES,
         "default_weights": {
             "view": VIEW_WEIGHT,
