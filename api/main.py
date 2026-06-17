@@ -556,45 +556,59 @@ def normalize_scores(score_dict):
 
 def get_dynamic_weights(user_id: str) -> dict:
     """
-    Shift the blend by how much behavior we know for this user.
-    Cold-start users lean on content and popularity; active users lean on CF.
+    Shift the blend smoothly by how much behavior we know for this user.
+    More history raises collaborative confidence; sparse users lean on content
+    and popularity until there is enough personal signal.
     """
 
-    history_count = len(user_seen_items.get(str(user_id), set()))
+    user_id = str(user_id)
+    history_count = len(user_seen_items.get(user_id, set()))
 
     if history_count == 0:
         return {
             "alpha": 0.0,
-            "beta": 0.45,
-            "gamma": 0.55,
+            "beta": 0.0,
+            "gamma": 1.0,
             "history_count": history_count,
+            "interaction_count": 0,
+            "total_interaction_weight": 0.0,
+            "confidence": 0.0,
             "profile": "cold_start",
         }
 
-    if history_count < 3:
-        return {
-            "alpha": 0.20,
-            "beta": 0.45,
-            "gamma": 0.35,
-            "history_count": history_count,
-            "profile": "new_user",
-        }
+    user_history = train[train["user_id"].astype(str) == user_id]
+    interaction_count = len(user_history)
+    total_weight = float(user_history["interaction_weight"].sum()) if not user_history.empty else 0.0
 
-    if history_count < 10:
-        return {
-            "alpha": 0.45,
-            "beta": 0.35,
-            "gamma": 0.20,
-            "history_count": history_count,
-            "profile": "warming_up",
-        }
+    item_confidence = 1.0 - np.exp(-history_count / 6.0)
+    event_confidence = 1.0 - np.exp(-interaction_count / 12.0)
+    weight_confidence = 1.0 - np.exp(-total_weight / 20.0)
+    confidence = float(
+        0.60 * item_confidence +
+        0.25 * event_confidence +
+        0.15 * weight_confidence
+    )
+
+    alpha = 0.05 + 0.60 * confidence
+    beta = 0.55 - 0.25 * confidence
+    gamma = 1.0 - alpha - beta
+
+    if confidence < 0.25:
+        profile = "new_user"
+    elif confidence < 0.65:
+        profile = "warming_up"
+    else:
+        profile = "active_user"
 
     return {
-        "alpha": 0.60,
-        "beta": 0.30,
-        "gamma": 0.10,
+        "alpha": round(float(alpha), 4),
+        "beta": round(float(beta), 4),
+        "gamma": round(float(gamma), 4),
         "history_count": history_count,
-        "profile": "active_user",
+        "interaction_count": interaction_count,
+        "total_interaction_weight": round(total_weight, 4),
+        "confidence": round(confidence, 4),
+        "profile": profile,
     }
 
 
@@ -841,6 +855,9 @@ def recommend(
             "cold_start": str(user_id) not in user_seen_items,
             "profile": weights["profile"],
             "history_count": weights["history_count"],
+            "interaction_count": weights["interaction_count"],
+            "total_interaction_weight": weights["total_interaction_weight"],
+            "confidence": weights["confidence"],
             "weights": {
                 "alpha": weights["alpha"],
                 "beta": weights["beta"],
