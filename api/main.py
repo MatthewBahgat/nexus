@@ -293,15 +293,32 @@ def interaction_to_train_row(interaction: dict) -> dict | None:
         first_value(interaction, "interactionType", "interaction_type", "type", default="view")
     ).lower()
     default_weight = BID_WEIGHT if "bid" in interaction_type else VIEW_WEIGHT
-    weight = as_float(first_value(interaction, "weight", "score", default=default_weight), default_weight)
+    weight = as_float(
+        first_value(
+            interaction,
+            "interactionWeight",
+            "interaction_weight",
+            "weight",
+            "score",
+            default=default_weight,
+        ),
+        default_weight,
+    )
 
     return {
         "user_id": str(user_id),
         "item_id": str(item_id),
-        "item_title": str(first_value(item, "name", "title", default="")),
+        "item_title": str(first_value(interaction, "itemTitle", "item_title", default=None) or first_value(item, "name", "title", default="")),
         "interaction_weight": weight,
         "interaction_timestamp": normalize_timestamp(
-            first_value(interaction, "createdAt", "created_at", "timestamp")
+            first_value(
+                interaction,
+                "interactionTimestamp",
+                "interaction_timestamp",
+                "createdAt",
+                "created_at",
+                "timestamp",
+            )
         ),
         "price": as_float(first_value(interaction, "price", "amount", "bidAmount", "bid_amount")),
     }
