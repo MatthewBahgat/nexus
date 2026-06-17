@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 import threading
 import time
 from collections import defaultdict
@@ -37,10 +38,13 @@ app.add_middleware(
 
 NEXUS_API_BASE_URL = os.getenv("NEXUS_API_BASE_URL", "https://nexus.tidygram.site").rstrip("/")
 NEXUS_API_TOKEN = os.getenv("NEXUS_API_TOKEN") or os.getenv("API_BEARER_TOKEN")
+NEXUS_API_EMAIL = os.getenv("NEXUS_API_EMAIL") or os.getenv("NEXUS_ADMIN_EMAIL")
+NEXUS_API_PASSWORD = os.getenv("NEXUS_API_PASSWORD") or os.getenv("NEXUS_ADMIN_PASSWORD")
 NEXUS_API_TIMEOUT = float(os.getenv("NEXUS_API_TIMEOUT", "20"))
 NEXUS_PAGE_LIMIT = int(os.getenv("NEXUS_PAGE_LIMIT", "100"))
 NEXUS_INTERACTION_LIMIT = int(os.getenv("NEXUS_INTERACTION_LIMIT", "500"))
 NEXUS_AUTO_REFRESH_MINUTES = float(os.getenv("NEXUS_AUTO_REFRESH_MINUTES", "5"))
+NEXUS_TOKEN_REFRESH_SKEW_SECONDS = int(os.getenv("NEXUS_TOKEN_REFRESH_SKEW_SECONDS", "60"))
 
 
 # Recommendation Weights
@@ -64,9 +68,93 @@ item_users = {}
 pop_map = {}
 refresh_lock = threading.Lock()
 auto_refresh_started = False
+auth_lock = threading.Lock()
+auth_token = NEXUS_API_TOKEN
+auth_token_exp = 0.0
 
 
 # API Loading
+
+def jwt_expiry(token: str | None) -> float:
+    if not token:
+        return 0.0
+
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        return float(json.loads(decoded).get("exp", 0))
+    except Exception:
+        return 0.0
+
+
+auth_token_exp = jwt_expiry(auth_token)
+
+
+def token_is_valid(token: str | None, exp: float) -> bool:
+    if not token:
+        return False
+
+    # Non-JWT tokens are accepted because we cannot inspect their expiry.
+    if exp <= 0:
+        return True
+
+    return time.time() < (exp - NEXUS_TOKEN_REFRESH_SKEW_SECONDS)
+
+
+def api_post(path: str, body: dict, authenticated: bool = False) -> dict:
+    url = urljoin(f"{NEXUS_API_BASE_URL}/", path.lstrip("/"))
+    encoded = json.dumps(body).encode("utf-8")
+    headers = api_headers(authenticated=authenticated)
+    headers["Content-Type"] = "application/json"
+    request = Request(url, data=encoded, headers=headers, method="POST")
+
+    try:
+        with urlopen(request, timeout=NEXUS_API_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"POST {path} failed with {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"POST {path} failed: {exc.reason}") from exc
+
+
+def get_access_token() -> str | None:
+    global auth_token
+    global auth_token_exp
+
+    with auth_lock:
+        if token_is_valid(auth_token, auth_token_exp):
+            return auth_token
+
+        if not NEXUS_API_EMAIL or not NEXUS_API_PASSWORD:
+            return auth_token
+
+        payload = api_post(
+            "/auth/login",
+            {
+                "email": NEXUS_API_EMAIL,
+                "password": NEXUS_API_PASSWORD,
+            },
+            authenticated=False,
+        )
+        token = payload.get("accessToken") or payload.get("access_token")
+
+        if not token:
+            raise RuntimeError("Auth login did not return an access token.")
+
+        auth_token = token
+        auth_token_exp = jwt_expiry(token)
+        return auth_token
+
+
+def get_access_token_safe() -> str | None:
+    try:
+        return get_access_token()
+    except Exception as exc:
+        print(f"Auth token unavailable: {exc}")
+        return None
+
 
 def api_headers(authenticated: bool = False) -> dict:
     headers = {
@@ -74,8 +162,10 @@ def api_headers(authenticated: bool = False) -> dict:
         "User-Agent": "nexus-recommender/2.1",
     }
 
-    if authenticated and NEXUS_API_TOKEN:
-        headers["Authorization"] = f"Bearer {NEXUS_API_TOKEN}"
+    if authenticated:
+        token = get_access_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
     return headers
 
@@ -227,7 +317,7 @@ def load_interactions_from_api() -> pd.DataFrame:
         "price",
     ]
 
-    if not NEXUS_API_TOKEN:
+    if not get_access_token_safe():
         return pd.DataFrame(columns=columns)
 
     interactions = fetch_paginated(
@@ -664,7 +754,8 @@ def health():
         "catalog_size": len(catalog),
         "interaction_count": len(train),
         "known_users": len(user_seen_items),
-        "authenticated_interactions": bool(NEXUS_API_TOKEN),
+        "authenticated_interactions": bool(get_access_token_safe()),
+        "auth_mode": "token" if NEXUS_API_TOKEN else "login" if NEXUS_API_EMAIL else "none",
         "auto_refresh_minutes": NEXUS_AUTO_REFRESH_MINUTES,
         "default_weights": {
             "view": VIEW_WEIGHT,
