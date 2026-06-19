@@ -257,6 +257,22 @@ def as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def as_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+
+    return default
+
+
 def normalize_timestamp(value: Any) -> Any:
     if value:
         return value
@@ -377,8 +393,15 @@ def load_interactions_from_api() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
-def load_auction_popularity() -> dict:
-    popularity = defaultdict(float)
+def auction_is_recommendable(auction: dict) -> bool:
+    status = str(first_value(auction, "status", default="")).strip().lower()
+    ended = as_bool(first_value(auction, "ended", "isEnded", "hasEnded", default=False))
+
+    return status in {"live", "scheduled"} and not ended
+
+
+def load_auction_signals() -> dict:
+    signals = {}
 
     try:
         auctions = fetch_paginated("/auctions")
@@ -390,7 +413,10 @@ def load_auction_popularity() -> dict:
         if item_id is None:
             continue
 
+        item_id = str(item_id)
         status = str(first_value(auction, "status", default="")).lower()
+        ended = as_bool(first_value(auction, "ended", "isEnded", "hasEnded", default=False))
+        recommendable = auction_is_recommendable(auction)
         status_boost = {
             "live": 3.0,
             "ended": 2.0,
@@ -399,9 +425,28 @@ def load_auction_popularity() -> dict:
         highest_price = as_float(first_value(auction, "currentHighestPrice", "current_highest_price"))
         reserve_price = as_float(first_value(auction, "reservePrice", "reserve_price"))
 
-        popularity[str(item_id)] += status_boost + max(highest_price, reserve_price, 0.0) / 1000.0
+        if item_id not in signals:
+            signals[item_id] = {
+                "popularity": 0.0,
+                "statuses": set(),
+                "ended": False,
+                "recommendable": False,
+            }
 
-    return dict(popularity)
+        signals[item_id]["popularity"] += status_boost + max(highest_price, reserve_price, 0.0) / 1000.0
+        signals[item_id]["statuses"].add(status or "unknown")
+        signals[item_id]["ended"] = signals[item_id]["ended"] or ended or status == "ended"
+        signals[item_id]["recommendable"] = signals[item_id]["recommendable"] or recommendable
+
+    return {
+        item_id: {
+            "popularity": values["popularity"],
+            "auction_status": ",".join(sorted(values["statuses"])),
+            "auction_ended": values["ended"],
+            "recommendable": values["recommendable"],
+        }
+        for item_id, values in signals.items()
+    }
 
 
 def load_from_api():
@@ -412,7 +457,18 @@ def load_from_api():
     """
 
     db_catalog = load_catalog_from_api()
+    auction_signals = load_auction_signals()
     db_train = load_interactions_from_api()
+
+    db_catalog["auction_status"] = db_catalog["item_id"].astype(str).map(
+        lambda item_id: auction_signals.get(item_id, {}).get("auction_status", "")
+    )
+    db_catalog["auction_ended"] = db_catalog["item_id"].astype(str).map(
+        lambda item_id: auction_signals.get(item_id, {}).get("auction_ended", False)
+    )
+    db_catalog["recommendable"] = db_catalog["item_id"].astype(str).map(
+        lambda item_id: auction_signals.get(item_id, {}).get("recommendable", False)
+    )
 
     if not db_train.empty:
         popularity = (
@@ -426,9 +482,10 @@ def load_from_api():
         db_catalog = db_catalog.merge(popularity, on="item_id", how="left")
         db_catalog["popularity"] = db_catalog["popularity"].fillna(0.0)
     else:
-        auction_popularity = load_auction_popularity()
         db_catalog["popularity"] = (
-            db_catalog["item_id"].astype(str).map(auction_popularity).fillna(0.0)
+            db_catalog["item_id"].astype(str).map(
+                lambda item_id: auction_signals.get(item_id, {}).get("popularity", 0.0)
+            ).fillna(0.0)
         )
 
     return db_catalog, db_train
@@ -723,9 +780,10 @@ def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
     weights = get_dynamic_weights(user_id)
 
     seen = user_seen_items.get(user_id, set())
+    recommendable_catalog = catalog[catalog["recommendable"].fillna(False)]
     candidates = [
         str(iid)
-        for iid in catalog["item_id"].astype(str).tolist()
+        for iid in recommendable_catalog["item_id"].astype(str).tolist()
         if str(iid) not in seen
     ]
 
@@ -766,7 +824,7 @@ def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
     top = results[:top_n]
 
     cat_map = catalog.set_index("item_id")[
-        ["item_title", "avg_price", "category", "popularity"]
+        ["item_title", "avg_price", "category", "popularity", "auction_status", "auction_ended"]
     ].to_dict("index")
 
     for r in top:
@@ -775,6 +833,8 @@ def hybrid_recommend(user_id: str, top_n: int = 10) -> list:
         r["category"] = str(info.get("category", ""))
         r["avg_price"] = round(float(info.get("avg_price", 0)), 2)
         r["popularity"] = round(float(info.get("popularity", 0)), 4)
+        r["auction_status"] = str(info.get("auction_status", ""))
+        r["auction_ended"] = bool(info.get("auction_ended", False))
 
     return top
 
@@ -808,6 +868,7 @@ def health():
         "mode": "api",
         "upstream_api": NEXUS_API_BASE_URL,
         "catalog_size": len(catalog),
+        "recommendable_items": int(catalog["recommendable"].sum()) if "recommendable" in catalog else 0,
         "interaction_count": len(train),
         "known_users": len(user_seen_items),
         "authenticated_interactions": bool(get_access_token_safe()),
@@ -872,12 +933,14 @@ def recommend(
 
 @app.get("/popular")
 def popular(top_n: int = Query(10, ge=1, le=50)):
-    top = catalog.nlargest(top_n, "popularity")[
-        ["item_id", "item_title", "category", "avg_price", "popularity"]
+    recommendable_catalog = catalog[catalog["recommendable"].fillna(False)]
+    top = recommendable_catalog.nlargest(top_n, "popularity")[
+        ["item_id", "item_title", "category", "avg_price", "popularity", "auction_status", "auction_ended"]
     ].copy()
 
     top["popularity"] = top["popularity"].astype(float)
     top["avg_price"] = top["avg_price"].astype(float)
+    top["auction_ended"] = top["auction_ended"].astype(bool)
 
     return {
         "count": len(top),
@@ -901,7 +964,7 @@ def similar_items(
 
     scores[idx] = 0
 
-    top_idx = np.argsort(scores)[::-1][:top_n]
+    top_idx = np.argsort(scores)[::-1]
 
     inv_map = {v: k for k, v in item_to_content_idx.items()}
     cat_map = catalog.set_index("item_id").to_dict("index")
@@ -912,13 +975,24 @@ def similar_items(
         similar_item_id = inv_map[i]
         info = cat_map.get(similar_item_id, {})
 
+        if similar_item_id == item_id:
+            continue
+
+        if not bool(info.get("recommendable", False)):
+            continue
+
         results.append({
             "item_id": similar_item_id,
             "item_title": str(info.get("item_title", "")),
             "category": str(info.get("category", "")),
             "avg_price": round(float(info.get("avg_price", 0)), 2),
+            "auction_status": str(info.get("auction_status", "")),
+            "auction_ended": bool(info.get("auction_ended", False)),
             "similarity": round(float(scores[i]), 4),
         })
+
+        if len(results) >= top_n:
+            break
 
     return {
         "seed_item": {
@@ -941,12 +1015,14 @@ def list_users(limit: int = Query(20, ge=1, le=200)):
 
 @app.get("/items")
 def list_items(limit: int = Query(20, ge=1, le=200)):
-    items = catalog.head(limit)[
-        ["item_id", "item_title", "category", "avg_price", "popularity"]
+    recommendable_catalog = catalog[catalog["recommendable"].fillna(False)]
+    items = recommendable_catalog.head(limit)[
+        ["item_id", "item_title", "category", "avg_price", "popularity", "auction_status", "auction_ended"]
     ].copy()
 
     items["popularity"] = items["popularity"].astype(float)
     items["avg_price"] = items["avg_price"].astype(float)
+    items["auction_ended"] = items["auction_ended"].astype(bool)
 
     return {
         "count": len(items),
