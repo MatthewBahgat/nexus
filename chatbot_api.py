@@ -6,6 +6,7 @@ Nexus Auctions — Standalone FastAPI chatbot
 import os
 import re
 import random
+import sqlite3
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,8 +53,7 @@ client = Groq(api_key=GROQ_API_KEY)
 # ── Globals ───────────────────────────────────────────────────────────────────
 
 _ready = False
-_collection = None
-_sbert = None
+_documents = []
 _rag_error = None
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
@@ -66,29 +66,34 @@ Be concise and professional.
 # ── RAG INIT ──────────────────────────────────────────────────────────────────
 
 def init_rag():
-    global _ready, _collection, _sbert, _rag_error
+    global _ready, _documents, _rag_error
 
     if _ready:
         return True
 
     try:
-        import chromadb
-        from sentence_transformers import SentenceTransformer
+        db_path = os.path.join(CHROMA_DIR, "chroma.sqlite3")
 
-        if not os.path.exists(CHROMA_DIR):
-            _rag_error = f"ChromaDB not found at {CHROMA_DIR}"
+        if not os.path.exists(db_path):
+            _rag_error = f"Chroma SQLite database not found at {db_path}"
             print(f"[ARIA] {_rag_error}")
             return False
 
-        client_db = chromadb.PersistentClient(path=CHROMA_DIR)
-        _collection = client_db.get_collection("nexus_knowledge")
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            """
+            SELECT string_value
+            FROM embedding_fulltext_search
+            WHERE string_value IS NOT NULL
+            """
+        ).fetchall()
+        conn.close()
 
-        _sbert = SentenceTransformer("all-MiniLM-L6-v2")
-
-        _ready = True
+        _documents = [row[0] for row in rows if row[0]]
+        _ready = bool(_documents)
         _rag_error = None
-        print(f"[ARIA] Ready. {_collection.count()} docs loaded.")
-        return True
+        print(f"[ARIA] Ready. {len(_documents)} docs loaded.")
+        return _ready
 
     except Exception as e:
         _rag_error = str(e)
@@ -97,13 +102,36 @@ def init_rag():
 
 
 def retrieve(query, n=3):
-    emb = _sbert.encode([query]).tolist()
-    result = _collection.query(query_embeddings=emb, n_results=n)
-    return result.get("documents", [[]])[0]
+    if not _ready:
+        return []
 
-# ── Load RAG on startup ───────────────────────────────────────────────────────
+    stopwords = {
+        "the", "and", "for", "with", "that", "this", "what", "how", "can",
+        "you", "are", "about", "from", "into", "does", "have", "item",
+        "items", "auction", "auctions", "nexus"
+    }
+    query_terms = [
+        term for term in re.findall(r"[a-z0-9]+", query.lower())
+        if len(term) > 2 and term not in stopwords
+    ]
 
-init_rag()
+    if not query_terms:
+        return _documents[:n]
+
+    scored = []
+    for doc in _documents:
+        doc_lower = doc.lower()
+        score = 0
+        for term in query_terms:
+            if term in doc_lower:
+                score += 2 + doc_lower.count(term)
+        if query.lower() in doc_lower:
+            score += 5
+        if score:
+            scored.append((score, doc))
+
+    scored.sort(key=lambda row: row[0], reverse=True)
+    return [doc for _, doc in scored[:n]]
 
 # ── Request Model ─────────────────────────────────────────────────────────────
 
@@ -129,10 +157,13 @@ def root():
 
 @app.get("/health")
 def health():
+    if not _ready:
+        init_rag()
+
     return {
         "status": "ok",
         "rag_ready": _ready,
-        "docs": _collection.count() if _ready else 0,
+        "docs": len(_documents),
         "rag_error": _rag_error,
         "model": GROQ_MODEL
     }
