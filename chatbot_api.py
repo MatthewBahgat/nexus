@@ -96,6 +96,12 @@ OUT_OF_SCOPE_PATTERNS = [
     "football", "movie", "song", "stock market", "president"
 ]
 
+HOW_TO_BID_PATTERNS = [
+    "how to bid", "how do i bid", "how can i bid", "how to place a bid",
+    "how do i place a bid", "how can i place a bid", "place bid",
+    "make a bid", "start bidding", "bid on an item", "bid on auction"
+]
+
 # ── RAG INIT ──────────────────────────────────────────────────────────────────
 
 def init_rag():
@@ -183,6 +189,14 @@ def is_out_of_scope(message: str) -> bool:
     has_out_of_scope_term = any(term in lowered for term in OUT_OF_SCOPE_PATTERNS)
     return has_out_of_scope_term and not has_nexus_term
 
+
+def is_how_to_bid(message: str) -> bool:
+    lowered = message.lower()
+    strategy_terms = ["strategy", "best time", "when should", "sniping", "last minute"]
+    if any(term in lowered for term in strategy_terms):
+        return False
+    return any(pattern in lowered for pattern in HOW_TO_BID_PATTERNS)
+
 # ── Request Model ─────────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
@@ -220,6 +234,18 @@ def health():
 
 @app.post("/chat")
 def chat(req: ChatRequest):
+
+    if is_how_to_bid(req.message):
+        return {
+            "response": (
+                "To place a bid, open the auction item, click Place Bid, and "
+                "enter your maximum bid amount. Nexus will autobid for you up "
+                "to that maximum when needed. The highest bidder wins when the "
+                "auction ends, as long as the reserve price is met."
+            ),
+            "intent": "how_to_bid",
+            "escalate": False
+        }
 
     if is_security_attack(req.message):
         return {
