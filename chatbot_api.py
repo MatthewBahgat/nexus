@@ -54,6 +54,7 @@ client = Groq(api_key=GROQ_API_KEY)
 _ready = False
 _collection = None
 _sbert = None
+_rag_error = None
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
@@ -65,7 +66,7 @@ Be concise and professional.
 # ── RAG INIT ──────────────────────────────────────────────────────────────────
 
 def init_rag():
-    global _ready, _collection, _sbert
+    global _ready, _collection, _sbert, _rag_error
 
     if _ready:
         return True
@@ -75,7 +76,8 @@ def init_rag():
         from sentence_transformers import SentenceTransformer
 
         if not os.path.exists(CHROMA_DIR):
-            print("[ARIA] ChromaDB not found.")
+            _rag_error = f"ChromaDB not found at {CHROMA_DIR}"
+            print(f"[ARIA] {_rag_error}")
             return False
 
         client_db = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -84,11 +86,13 @@ def init_rag():
         _sbert = SentenceTransformer("all-MiniLM-L6-v2")
 
         _ready = True
+        _rag_error = None
         print(f"[ARIA] Ready. {_collection.count()} docs loaded.")
         return True
 
     except Exception as e:
-        print(f"[ARIA] Init failed: {e}")
+        _rag_error = str(e)
+        print(f"[ARIA] Init failed: {_rag_error}")
         return False
 
 
@@ -129,6 +133,7 @@ def health():
         "status": "ok",
         "rag_ready": _ready,
         "docs": _collection.count() if _ready else 0,
+        "rag_error": _rag_error,
         "model": GROQ_MODEL
     }
 
