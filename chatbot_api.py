@@ -102,6 +102,14 @@ HOW_TO_BID_PATTERNS = [
     "make a bid", "start bidding", "bid on an item", "bid on auction"
 ]
 
+AUCTION_TIME_PATTERNS = [
+    "time on the bid", "time on bid", "bid time", "bidding time",
+    "auction time", "time left", "how much time", "countdown",
+    "when does it end", "when does auction end", "when will it end",
+    "end time", "ending time", "start time", "when does it start",
+    "when will it start"
+]
+
 GREETING_PATTERNS = [
     "hi", "hello", "hey", "hii", "good morning", "good afternoon",
     "good evening"
@@ -220,6 +228,16 @@ def is_how_to_bid(message: str) -> bool:
     return any(pattern in lowered for pattern in HOW_TO_BID_PATTERNS)
 
 
+def is_auction_time_question(message: str) -> bool:
+    lowered = message.lower()
+    strategy_terms = ["best time", "when should i bid", "sniping", "strategy"]
+    if any(term in lowered for term in strategy_terms):
+        return False
+    has_time_pattern = any(pattern in lowered for pattern in AUCTION_TIME_PATTERNS)
+    has_auction_context = any(term in lowered for term in ["bid", "auction", "item", "lot"])
+    return has_time_pattern and has_auction_context
+
+
 def is_greeting(message: str) -> bool:
     normalized = normalize_message(message)
     return normalized in GREETING_PATTERNS
@@ -328,6 +346,18 @@ def chat(req: ChatRequest):
                 "auction ends, as long as the reserve price is met."
             ),
             "intent": "how_to_bid",
+            "escalate": False
+        }
+
+    if is_auction_time_question(req.message):
+        return {
+            "response": (
+                "To check the bidding time, open the auction item page and look "
+                "at its countdown, start time, or end time. Live auctions show "
+                "how much time is left; scheduled auctions show when bidding "
+                "starts; ended auctions are no longer open for bids."
+            ),
+            "intent": "auction_time",
             "escalate": False
         }
 
