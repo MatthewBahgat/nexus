@@ -235,13 +235,6 @@ def is_acknowledgement(message: str) -> bool:
     return normalized in ACKNOWLEDGEMENT_PATTERNS
 
 
-def is_short_off_topic(message: str) -> bool:
-    normalized = normalize_message(message)
-    terms = re.findall(r"[a-z0-9]+", normalized)
-    if not terms or len(terms) > 3:
-        return False
-    return not any(term in normalized for term in NEXUS_TERMS)
-
 # ── Request Model ─────────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
@@ -323,17 +316,6 @@ def chat(req: ChatRequest):
         return {
             "response": "Glad to help. Ask me anything about Nexus Auctions.",
             "intent": "acknowledgement",
-            "escalate": False
-        }
-
-    if is_short_off_topic(req.message):
-        return {
-            "response": (
-                "I can help with Nexus Auctions. Ask me about bidding, buyer "
-                "premiums, reserve prices, payments, shipping, accounts, or "
-                "specific auction items."
-            ),
-            "intent": "out_of_scope",
             "escalate": False
         }
 
