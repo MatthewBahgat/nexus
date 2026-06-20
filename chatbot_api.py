@@ -7,6 +7,7 @@ import os
 import re
 import random
 import sqlite3
+from collections import Counter
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -183,10 +184,18 @@ def retrieve(query, n=3):
     scored = []
     for doc in _documents:
         doc_lower = doc.lower()
+        doc_terms = re.findall(r"[a-z0-9]+", doc_lower)
+        doc_counts = Counter(doc_terms)
         score = 0
         for term in query_terms:
-            if term in doc_lower:
-                score += 2 + doc_lower.count(term)
+            count = doc_counts.get(term, 0)
+            if term == "bid":
+                count += sum(
+                    freq for token, freq in doc_counts.items()
+                    if token.startswith("bid")
+                )
+            if count:
+                score += 2 + count
         if query.lower() in doc_lower:
             score += 5
         if score:
