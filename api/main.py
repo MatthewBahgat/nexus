@@ -91,6 +91,10 @@ item_to_content_idx = {}
 user_seen_items = {}
 item_users = {}
 pop_map = {}
+interaction_source_counts = {
+    "recommender_interactions": 0,
+    "auction_bids": 0,
+}
 refresh_lock = threading.Lock()
 auto_refresh_started = False
 auth_lock = threading.Lock()
@@ -393,6 +397,74 @@ def load_interactions_from_api() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+def bid_to_train_row(bid: dict, auction: dict) -> dict | None:
+    user_id = first_value(bid, "bidderId", "bidder_id", "userId", "user_id")
+    item_id = first_value(auction, "itemId", "item_id")
+    item = auction.get("item") or {}
+
+    if item_id is None:
+        item_id = first_value(item, "id")
+
+    if user_id is None or item_id is None:
+        return None
+
+    return {
+        "user_id": str(user_id),
+        "item_id": str(item_id),
+        "item_title": str(first_value(item, "name", "title", default="")),
+        "interaction_weight": BID_WEIGHT,
+        "interaction_timestamp": normalize_timestamp(
+            first_value(bid, "bidTime", "bid_time", "createdAt", "created_at", "timestamp")
+        ),
+        "price": as_float(first_value(bid, "bidAmount", "bid_amount", "amount", "price")),
+    }
+
+
+def load_bid_interactions_from_api(auctions: list[dict] | None = None) -> pd.DataFrame:
+    columns = [
+        "user_id",
+        "item_id",
+        "item_title",
+        "interaction_weight",
+        "interaction_timestamp",
+        "price",
+    ]
+
+    if auctions is None:
+        try:
+            auctions = fetch_paginated("/auctions")
+        except RuntimeError:
+            return pd.DataFrame(columns=columns)
+
+    rows = []
+
+    for auction in auctions:
+        auction_id = first_value(auction, "id")
+        if auction_id is None:
+            continue
+
+        bids_count = int(as_float(first_value(auction, "bidsCount", "bids_count", default=0)))
+        if bids_count <= 0:
+            continue
+
+        try:
+            bids = fetch_paginated(
+                f"/auctions/{auction_id}/bids",
+                limit=100,
+                authenticated=False,
+            )
+        except RuntimeError as exc:
+            print(f"Could not fetch bids for auction {auction_id}: {exc}")
+            continue
+
+        for bid in bids:
+            row = bid_to_train_row(bid, auction)
+            if row:
+                rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def auction_is_recommendable(auction: dict) -> bool:
     status = str(first_value(auction, "status", default="")).strip().lower()
     ended = as_bool(first_value(auction, "ended", "isEnded", "hasEnded", default=False))
@@ -400,13 +472,14 @@ def auction_is_recommendable(auction: dict) -> bool:
     return status in {"live", "scheduled"} and not ended
 
 
-def load_auction_signals() -> dict:
+def load_auction_signals(auctions: list[dict] | None = None) -> dict:
     signals = {}
 
-    try:
-        auctions = fetch_paginated("/auctions")
-    except RuntimeError:
-        return {}
+    if auctions is None:
+        try:
+            auctions = fetch_paginated("/auctions")
+        except RuntimeError:
+            return {}
 
     for auction in auctions:
         item_id = first_value(auction, "itemId", "item_id")
@@ -456,9 +529,30 @@ def load_from_api():
     data comes from /recommender-interactions when NEXUS_API_TOKEN is provided.
     """
 
+    global interaction_source_counts
+
     db_catalog = load_catalog_from_api()
-    auction_signals = load_auction_signals()
-    db_train = load_interactions_from_api()
+    try:
+        auctions = fetch_paginated("/auctions")
+    except RuntimeError as exc:
+        print(f"Could not fetch auctions: {exc}")
+        auctions = []
+    auction_signals = load_auction_signals(auctions)
+    recommender_train = load_interactions_from_api()
+    bid_train = load_bid_interactions_from_api(auctions)
+
+    db_train = pd.concat([recommender_train, bid_train], ignore_index=True)
+
+    if not db_train.empty:
+        db_train = db_train.drop_duplicates(
+            subset=["user_id", "item_id", "interaction_timestamp", "interaction_weight"],
+            keep="last",
+        )
+
+    interaction_source_counts = {
+        "recommender_interactions": len(recommender_train),
+        "auction_bids": len(bid_train),
+    }
 
     db_catalog["auction_status"] = db_catalog["item_id"].astype(str).map(
         lambda item_id: auction_signals.get(item_id, {}).get("auction_status", "")
@@ -870,6 +964,7 @@ def health():
         "catalog_size": len(catalog),
         "recommendable_items": int(catalog["recommendable"].sum()) if "recommendable" in catalog else 0,
         "interaction_count": len(train),
+        "interaction_sources": interaction_source_counts,
         "known_users": len(user_seen_items),
         "authenticated_interactions": bool(get_access_token_safe()),
         "auth_mode": "token" if NEXUS_API_TOKEN else "login" if NEXUS_API_EMAIL else "none",
@@ -896,6 +991,7 @@ def refresh():
             "status": "refreshed",
             "catalog_size": len(catalog),
             "interaction_count": len(train),
+            "interaction_sources": interaction_source_counts,
             "known_users": len(user_seen_items),
         }
     except Exception as e:
