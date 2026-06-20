@@ -102,6 +102,21 @@ HOW_TO_BID_PATTERNS = [
     "make a bid", "start bidding", "bid on an item", "bid on auction"
 ]
 
+GREETING_PATTERNS = [
+    "hi", "hello", "hey", "hii", "good morning", "good afternoon",
+    "good evening"
+]
+
+CAPABILITY_PATTERNS = [
+    "what do you do", "what can you do", "who are you", "what are you",
+    "how can you help", "what do u do", "what can u do"
+]
+
+ACKNOWLEDGEMENT_PATTERNS = [
+    "ok", "okay", "great", "thanks", "thank you", "cool", "nice",
+    "perfect", "got it", "alright"
+]
+
 # ── RAG INIT ──────────────────────────────────────────────────────────────────
 
 def init_rag():
@@ -173,6 +188,13 @@ def retrieve(query, n=3):
     return [doc for _, doc in scored[:n]]
 
 
+def normalize_message(message: str) -> str:
+    lowered = message.lower().strip()
+    lowered = re.sub(r"\bu\b", "you", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip(" !?.")
+
+
 def is_security_attack(message: str) -> bool:
     lowered = message.lower()
     return any(pattern in lowered for pattern in SECURITY_PATTERNS)
@@ -196,6 +218,29 @@ def is_how_to_bid(message: str) -> bool:
     if any(term in lowered for term in strategy_terms):
         return False
     return any(pattern in lowered for pattern in HOW_TO_BID_PATTERNS)
+
+
+def is_greeting(message: str) -> bool:
+    normalized = normalize_message(message)
+    return normalized in GREETING_PATTERNS
+
+
+def is_capability_question(message: str) -> bool:
+    normalized = normalize_message(message)
+    return any(pattern in normalized for pattern in CAPABILITY_PATTERNS)
+
+
+def is_acknowledgement(message: str) -> bool:
+    normalized = normalize_message(message)
+    return normalized in ACKNOWLEDGEMENT_PATTERNS
+
+
+def is_short_off_topic(message: str) -> bool:
+    normalized = normalize_message(message)
+    terms = re.findall(r"[a-z0-9]+", normalized)
+    if not terms or len(terms) > 3:
+        return False
+    return not any(term in normalized for term in NEXUS_TERMS)
 
 # ── Request Model ─────────────────────────────────────────────────────────────
 
@@ -235,18 +280,6 @@ def health():
 @app.post("/chat")
 def chat(req: ChatRequest):
 
-    if is_how_to_bid(req.message):
-        return {
-            "response": (
-                "To place a bid, open the auction item, click Place Bid, and "
-                "enter your maximum bid amount. Nexus will autobid for you up "
-                "to that maximum when needed. The highest bidder wins when the "
-                "auction ends, as long as the reserve price is met."
-            ),
-            "intent": "how_to_bid",
-            "escalate": False
-        }
-
     if is_security_attack(req.message):
         return {
             "response": (
@@ -266,6 +299,54 @@ def chat(req: ChatRequest):
             ),
             "intent": "emergency",
             "escalate": True
+        }
+
+    if is_greeting(req.message):
+        return {
+            "response": "Hello. I can help with Nexus Auctions questions.",
+            "intent": "greeting",
+            "escalate": False
+        }
+
+    if is_capability_question(req.message):
+        return {
+            "response": (
+                "I'm ARIA, the Nexus Auctions assistant. I can help with how "
+                "to bid, buyer premiums, reserve prices, payments, shipping, "
+                "account questions, item details, and auction insights."
+            ),
+            "intent": "capability",
+            "escalate": False
+        }
+
+    if is_acknowledgement(req.message):
+        return {
+            "response": "Glad to help. Ask me anything about Nexus Auctions.",
+            "intent": "acknowledgement",
+            "escalate": False
+        }
+
+    if is_short_off_topic(req.message):
+        return {
+            "response": (
+                "I can help with Nexus Auctions. Ask me about bidding, buyer "
+                "premiums, reserve prices, payments, shipping, accounts, or "
+                "specific auction items."
+            ),
+            "intent": "out_of_scope",
+            "escalate": False
+        }
+
+    if is_how_to_bid(req.message):
+        return {
+            "response": (
+                "To place a bid, open the auction item, click Place Bid, and "
+                "enter your maximum bid amount. Nexus will autobid for you up "
+                "to that maximum when needed. The highest bidder wins when the "
+                "auction ends, as long as the reserve price is met."
+            ),
+            "intent": "how_to_bid",
+            "escalate": False
         }
 
     if is_out_of_scope(req.message):
