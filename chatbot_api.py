@@ -103,6 +103,15 @@ HOW_TO_BID_PATTERNS = [
     "make a bid", "start bidding", "bid on an item", "bid on auction"
 ]
 
+BID_CANCELLATION_PATTERNS = [
+    "cancel my bid", "cancel a bid", "cancel bid", "remove my bid",
+    "remove a bid", "remove bid", "delete my bid", "delete a bid",
+    "delete bid", "withdraw my bid", "withdraw a bid", "withdraw bid",
+    "retract my bid", "retract a bid", "retract bid", "take back my bid",
+    "undo my bid", "reverse my bid", "can i cancel my bid",
+    "can i remove my bid", "can i withdraw my bid", "can i retract my bid"
+]
+
 AUCTION_TIME_PATTERNS = [
     "time on the bid", "time on bid", "bid time", "bidding time",
     "auction time", "time left", "how much time", "countdown",
@@ -310,6 +319,11 @@ def is_emergency(message: str) -> bool:
     return any(pattern in lowered for pattern in EMERGENCY_PATTERNS)
 
 
+def is_bid_cancellation_question(message: str) -> bool:
+    lowered = message.lower()
+    return any(pattern in lowered for pattern in BID_CANCELLATION_PATTERNS)
+
+
 def is_out_of_scope(message: str) -> bool:
     lowered = message.lower()
     has_nexus_term = any(term in lowered for term in NEXUS_TERMS)
@@ -407,6 +421,19 @@ def chat(req: ChatRequest):
             ),
             "intent": "emergency",
             "escalate": True
+        }
+
+    if is_bid_cancellation_question(req.message):
+        return {
+            "response": (
+                "No. Bids on Nexus Auctions are final and cannot be cancelled, "
+                "removed, withdrawn, or deleted after submission. If you think "
+                "there is an account security issue or a serious payment problem, "
+                "contact Nexus Auctions support, but normal bid withdrawal is not "
+                "available."
+            ),
+            "intent": "bid_cancellation",
+            "escalate": False
         }
 
     if is_greeting(req.message):
