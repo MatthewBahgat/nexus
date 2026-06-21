@@ -14,6 +14,50 @@ STOPWORDS = {
     "items", "auction", "auctions", "nexus"
 }
 
+QUERY_EXPANSIONS = {
+    "additional": ["premium", "fee"],
+    "extra": ["premium", "fee"],
+    "fee": ["premium"],
+    "fees": ["premium"],
+    "percent": ["premium", "hammer"],
+    "total": ["premium", "hammer"],
+    "charge": ["premium"],
+    "minimum": ["reserve"],
+    "lowest": ["reserve"],
+    "hidden": ["reserve"],
+    "accepts": ["reserve"],
+    "unsold": ["reserve"],
+    "offer": ["bid"],
+    "work": ["place", "bid"],
+    "works": ["place", "bid"],
+    "button": ["place", "bid"],
+    "press": ["place", "bid"],
+    "automatically": ["autobid", "proxy"],
+    "automatic": ["autobid", "proxy"],
+    "proxy": ["autobid"],
+    "snipers": ["sniping"],
+    "sniper": ["sniping"],
+    "protect": ["autobid", "sniping"],
+    "win": ["winning"],
+    "payment": ["winning", "payment"],
+    "pay": ["winning", "payment"],
+    "ship": ["winning", "ship"],
+    "photograph": ["selling", "photography"],
+    "photos": ["selling", "photography"],
+    "commission": ["selling", "commission"],
+    "products": ["categories"],
+    "listed": ["categories"],
+    "reliable": ["ratings"],
+    "score": ["ratings"],
+    "typical": ["average"],
+    "sale": ["closing"],
+    "concentrated": ["patterns"],
+    "usually": ["patterns"],
+    "seven": ["7"],
+    "listings": ["auction", "duration"],
+    "money": ["price", "average"],
+}
+
 
 def load_documents():
     conn = sqlite3.connect(DB_PATH)
@@ -47,6 +91,7 @@ def retrieve(query, docs, n=10):
         term for term in re.findall(r"[a-z0-9]+", query.lower())
         if (len(term) > 2 or term.isdigit()) and term not in STOPWORDS
     ]
+    query_terms = expand_query_terms(query_terms)
 
     if not query_terms and not prefix_query:
         return docs[:n]
@@ -90,6 +135,13 @@ def retrieve(query, docs, n=10):
 
     scored.sort(key=lambda row: row[0], reverse=True)
     return [doc for _, doc in scored[:n]]
+
+
+def expand_query_terms(terms):
+    expanded = list(terms)
+    for term in terms:
+        expanded.extend(QUERY_EXPANSIONS.get(term, []))
+    return list(dict.fromkeys(expanded))
 
 
 def build_cases(docs):
