@@ -168,6 +168,7 @@ def retrieve(query, n=3):
     if not _ready:
         return []
 
+    prefix_query = extract_item_prefix_query(query)
     stopwords = {
         "the", "and", "for", "with", "that", "this", "what", "how", "can",
         "you", "are", "about", "from", "into", "does", "have", "item",
@@ -175,7 +176,7 @@ def retrieve(query, n=3):
     }
     query_terms = [
         term for term in re.findall(r"[a-z0-9]+", query.lower())
-        if len(term) > 2 and term not in stopwords
+        if (len(term) > 2 or term.isdigit()) and term not in stopwords
     ]
 
     if not query_terms:
@@ -187,6 +188,22 @@ def retrieve(query, n=3):
         doc_terms = re.findall(r"[a-z0-9]+", doc_lower)
         doc_counts = Counter(doc_terms)
         score = 0
+
+        if prefix_query and doc_lower.startswith(f"items starting with '{prefix_query}':"):
+            score += 1000
+
+        if (
+            doc_lower.startswith("auction duration comparison")
+            and "day" in query_terms
+            and "average" in query_terms
+        ):
+            score += 50
+
+        if not doc_lower.startswith("items starting with ") and ":" in doc_lower:
+            title = doc_lower.split(":", 1)[0]
+            title_terms = set(re.findall(r"[a-z0-9]+", title))
+            score += 12 * len(title_terms & set(query_terms))
+
         for term in query_terms:
             count = doc_counts.get(term, 0)
             if term == "bid":
@@ -203,6 +220,23 @@ def retrieve(query, n=3):
 
     scored.sort(key=lambda row: row[0], reverse=True)
     return [doc for _, doc in scored[:n]]
+
+
+def extract_item_prefix_query(query: str) -> str | None:
+    normalized = query.lower().strip()
+    normalized = normalized.strip(" !?.")
+
+    patterns = [
+        r"(?:items?\s+)?starting\s+with\s+['\"]?([^'\"\s]+)",
+        r"^(.+?)\s+items?$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return match.group(1).strip(" '\"")
+
+    return None
 
 
 def normalize_message(message: str) -> str:
